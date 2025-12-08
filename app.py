@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (中英圖號對照版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (中英圖號對照版)")
-st.caption("修正：支援 Word(FIG.) 與 PDF(图/圖) 之間的自動對應，解決中文專利缺圖問題。")
+st.set_page_config(page_title="PPT 重組生成器 (精準抓圖版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (精準抓圖版)")
+st.caption("修正：自動跳過 PDF 文字說明頁(精準抓圖)、PPT 右上角同時保留圖片與文字。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -29,7 +29,7 @@ nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不�
 5. 代表圖：*(根據發明精神建議3張最可以說明發明精神的圖片，範例:FIG.3)
 6. 獨立項claim： *(分組且分行條列式+對應的代表圖，claim要(1)有位階縮排 (2)claim的元件要有標號 (3)對應的claim號碼)"""
 
-st.info("💡 **NBLM 使用提示詞** (已更新，點擊下方綠色按鈕一鍵複製)")
+st.info("💡 **NBLM 使用提示詞** (點擊下方綠色按鈕一鍵複製)")
 
 components.html(
     f"""
@@ -78,65 +78,69 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 函數：搜尋 PDF 截圖 (關鍵修正：中英文圖號自動對照) ---
+# --- 函數：搜尋 PDF 截圖 (修正：跳過說明文字頁) ---
 def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
     if not target_fig_text:
         return None, "Word 中未指定代表圖文字"
     try:
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
         
-        # 1. 先從 Word 文字中抓出「圖號數字」 (例如從 "FIG. 3E" 抓出 "3E")
-        # 支援格式: FIG.3E, Figure 3E, 图3E, 圖3E
+        # 1. 抓出圖號 (例如 3E)
         number_match = re.search(r'(?:FIG\.?|Figure|图|圖)\s*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
-        
         target_numbers = []
         if number_match:
-            target_numbers.append(number_match.group(1)) # 抓到 "3E"
+            target_numbers.append(number_match.group(1))
         else:
-            # 如果 Regex 沒抓到，嘗試抓第一行前幾個字當作備用
             first_line = target_fig_text.split('\n')[0].strip()
             if first_line:
-                # 嘗試移除常見前綴
                 clean = re.sub(r'^(FIG\.?|Figure|图|圖)[:：\s]*', '', first_line, flags=re.IGNORECASE)
-                target_numbers.append(clean[:5]) # 取前5個字
+                target_numbers.append(clean[:5])
 
         if not target_numbers:
             return None, "無法識別圖號"
 
-        target_number = target_numbers[0].strip() # 例如 "3E"
+        target_number = target_numbers[0].strip()
 
-        # 2. 建立「搜尋關鍵字列表」 (包含 中文/英文/繁體)
-        # 只要 PDF 裡出現這些任何一個，都算找到
+        # 2. 建立搜尋關鍵字
         search_candidates = [
-            f"FIG.{target_number}",   # FIG.3E
-            f"FIG{target_number}",    # FIG3E
-            f"FIGURE{target_number}", # FIGURE3E
-            f"图{target_number}",     # 图3E (簡中)
-            f"圖{target_number}",     # 圖3E (繁中)
-            f"FIG {target_number}",   # FIG 3E (帶空格)
-            f"图 {target_number}",    # 图 3E
-            f"圖 {target_number}"     # 圖 3E
+            f"FIG.{target_number}", f"FIG{target_number}", f"FIGURE{target_number}",
+            f"图{target_number}", f"圖{target_number}", f"FIG {target_number}",
+            f"图 {target_number}", f"圖 {target_number}"
         ]
-        
-        # 將所有候選字轉大寫並去空白，方便比對
         normalized_candidates = [c.replace(" ", "").upper() for c in search_candidates]
+
+        # 3. 定義要「跳過」的頁面特徵 (避免抓到純文字說明頁)
+        # 如果頁面包含這些標題，通常代表是文字描述而非圖片
+        skip_keywords = ["附图说明", "BRIEF DESCRIPTION", "具体实施方式", "DETAILED DESCRIPTION", "DESCRIPTION OF DRAWINGS"]
 
         found_page_index = None
         matched_keyword_log = ""
 
-        # 3. 遍歷 PDF 頁面
+        # 4. 遍歷 PDF
         for i, page in enumerate(doc):
-            # 取得頁面文字，轉大寫並去空白
-            page_text = page.get_text().replace(" ", "").replace("\n", "").upper()
+            page_text = page.get_text() # 保留原始文字用於檢查 skip
+            upper_page_text = page_text.upper()
             
+            # 檢查是否為需要跳過的文字頁
+            should_skip = False
+            for skip_kw in skip_keywords:
+                if skip_kw in page_text or skip_kw.upper() in upper_page_text:
+                    should_skip = True
+                    break
+            
+            if should_skip:
+                continue # 跳過此頁，繼續找下一頁
+
+            # 檢查是否包含目標圖號
+            clean_text = upper_page_text.replace(" ", "").replace("\n", "")
             for candidate in normalized_candidates:
-                if candidate in page_text:
+                if candidate in clean_text:
                     found_page_index = i
                     matched_keyword_log = candidate
-                    break # 找到一種就跳出
+                    break
             
             if found_page_index is not None:
-                break # 找到頁面就跳出
+                break
 
         if found_page_index is not None:
             page = doc[found_page_index]
@@ -144,7 +148,7 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
             pix = page.get_pixmap(matrix=mat)
             return pix.tobytes("png"), f"成功 (匹配: {matched_keyword_log})"
             
-        return None, f"PDF 中找不到對應圖號 (搜尋了: {target_number})"
+        return None, f"PDF 中找不到對應圖號 (搜尋: {target_number}, 已略過文字頁)"
 
     except Exception as e:
         return None, f"PDF 解析發生錯誤: {str(e)}"
@@ -152,10 +156,8 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
 # --- 函數：提取專利號 ---
 def extract_patent_number_from_text(text):
     clean_text = text.replace("：", ":").replace(" ", "")
-    # 恢復上一版正確的 Regex，支援斜線
     match = re.search(r'([a-zA-Z]{2,4}\d{4}[/]?\d+[a-zA-Z0-9]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
-    if match:
-        return match.group(1)
+    if match: return match.group(1)
     return ""
 
 # --- 函數：提取詳細 Header 資訊 ---
@@ -164,10 +166,8 @@ def extract_header_info_detail(raw_text):
     date = "(未找到)"
     company = "(未找到)"
     
-    # 1. 提取案號
     extracted_no = extract_patent_number_from_text(raw_text)
-    if extracted_no:
-        number = extracted_no
+    if extracted_no: number = extracted_no
     else:
         match_no = re.search(r'(?:公開號|案號)[:：\s]*([^\n]+)', raw_text)
         if match_no:
@@ -175,16 +175,12 @@ def extract_header_info_detail(raw_text):
             raw_no = re.split(r'\s+(?:日期|公司|申請人)[:：]', raw_no)[0]
             number = raw_no.strip()
 
-    # 2. 提取日期
     match_date = re.search(r'(?:日期)[:：\s]*(\d{4}[./-]\d{1,2}[./-]\d{1,2})', raw_text)
-    if match_date:
-        date = match_date.group(1).strip()
+    if match_date: date = match_date.group(1).strip()
     else:
         match_date_backup = re.search(r'(\d{4}[./-]\d{1,2}[./-]\d{1,2})', raw_text)
-        if match_date_backup:
-            date = match_date_backup.group(1).strip()
+        if match_date_backup: date = match_date_backup.group(1).strip()
 
-    # 3. 提取公司
     matches = re.findall(r'(?:公司|申請人)[:：\s]*(.*?)(?=\s+(?:公開號|案號|日期)[:：]|$)', raw_text)
     if matches:
         for candidate in reversed(matches):
@@ -204,8 +200,7 @@ def extract_date_for_sort(text):
 # --- 函數：提取公司 (排序用) ---
 def extract_company_for_sort(text):
     _, _, comp = extract_header_info_detail(text)
-    if comp != "(未找到)":
-        return comp
+    if comp != "(未找到)": return comp
     return "ZZZ"
 
 # --- 函數：解析 Word 檔案 ---
@@ -239,10 +234,8 @@ def parse_word_file(uploaded_docx):
                     current_case["clean_number"] = nb
                     current_case["clean_date"] = dt
                     current_case["clean_company"] = cp
-                    
                     if not current_case["problem"]: current_case["missing_fields"].append("解決問題")
                     cases.append(current_case)
-                    
                     current_case = {
                         "case_info": "", "problem": "", "spirit": "", "key_point": "", "rep_fig_text": "", "claim_text": "",
                         "image_data": None, "image_name": "Word匯入", "raw_case_no": "",
@@ -257,7 +250,6 @@ def parse_word_file(uploaded_docx):
                 if dt != "(未找到)": current_case["sort_date"] = dt.replace(".", "").replace("/", "").replace("-", "")
                 if cp != "(未找到)": current_case["sort_company"] = cp
                 if nb != "(未找到)": current_case["raw_case_no"] = nb
-                
                 continue
 
             if "解決問題" in text:
@@ -288,7 +280,6 @@ def parse_word_file(uploaded_docx):
                 if dt != "(未找到)": current_case["sort_date"] = dt.replace(".", "").replace("/", "").replace("-", "")
                 if cp != "(未找到)": current_case["sort_company"] = cp
                 if nb != "(未找到)": current_case["raw_case_no"] = nb
-
             elif current_field == "rep_fig":
                 current_case["rep_fig_text"] += "\n" + text
             elif current_field == "problem":
@@ -318,20 +309,15 @@ def split_claims_text(full_text):
     lines = full_text.split('\n')
     claims = []
     current_chunk = []
-    
     header_pattern = re.compile(r'(\(Claim\s*\d+\)|^\s*(Claim|獨立項)\s*\d+|^\s*\d+\.\s)', re.IGNORECASE)
-    
     for line in lines:
         if header_pattern.search(line):
             if current_chunk:
-                if "".join(current_chunk).strip():
-                    claims.append(current_chunk)
+                if "".join(current_chunk).strip(): claims.append(current_chunk)
             current_chunk = [line]
         else:
             current_chunk.append(line)
-            
-    if current_chunk and "".join(current_chunk).strip():
-        claims.append(current_chunk)
+    if current_chunk and "".join(current_chunk).strip(): claims.append(current_chunk)
     return claims
 
 # --- 側邊欄 ---
@@ -339,7 +325,6 @@ with st.sidebar:
     st.header("1. 匯入資料")
     word_files = st.file_uploader("Word 檔案 (可多選)", type=['docx'], accept_multiple_files=True)
     pdf_files = st.file_uploader("PDF 檔案 (可多選)", type=['pdf'], accept_multiple_files=True)
-    
     st.divider()
     st.header("2. 輸出設定")
     add_claim_slide = st.checkbox("✅ 是否產生 Claim 分頁", value=False, help="勾選後，程式會自動識別獨立項數量，並為每一組獨立項產生一頁")
@@ -347,10 +332,7 @@ with st.sidebar:
     if word_files and st.button("🔄 開始智能整合", type="primary"):
         all_cases = []
         status_report_list = []
-        
-        for wf in word_files:
-            all_cases.extend(parse_word_file(wf))
-        
+        for wf in word_files: all_cases.extend(parse_word_file(wf))
         pdf_file_map = {}
         if pdf_files:
             for pf in pdf_files:
@@ -359,21 +341,16 @@ with st.sidebar:
 
         match_count = 0
         current_ppt_page = 1 
-
         with st.spinner("處理中..."):
             all_cases.sort(key=lambda x: (x["sort_company"].upper(), x["sort_date"]))
-
             for case in all_cases:
                 case_key = case["raw_case_no"]
                 target_fig = case["rep_fig_text"]
-                
                 pages_this_case = 1 
                 if add_claim_slide:
                     c_groups = split_claims_text(case["claim_text"])
-                    if not c_groups and case["claim_text"].strip():
-                        pages_this_case += 1
-                    else:
-                        pages_this_case += len(c_groups)
+                    if not c_groups and case["claim_text"].strip(): pages_this_case += 1
+                    else: pages_this_case += len(c_groups)
                 
                 start_page = current_ppt_page
                 end_page = current_ppt_page + pages_this_case - 1
@@ -432,10 +409,8 @@ else:
                 st.markdown(f"**Case {i+1}**")
                 st.caption(f"{data['clean_company']} | {data['clean_date']}")
                 st.text(f"{data['clean_number']}")
-                
                 if data['image_data']: st.image(data['image_data'], use_column_width=True)
                 else: st.warning("無圖片")
-                
                 full_claim_text = data['claim_text']
                 claims_preview = split_claims_text(full_claim_text)
                 count_claims = len(claims_preview) if full_claim_text else 0
@@ -451,20 +426,35 @@ else:
             # === 第一頁 ===
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             
-            # 左上：使用清洗後的資訊，條列式
+            # 左上：案號
             left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
             txBox = slide.shapes.add_textbox(left, top, width, height)
             tf = txBox.text_frame; tf.word_wrap = True
-            
             p1 = tf.add_paragraph(); p1.text = f"公開號：{data['clean_number']}"; p1.font.size = Pt(20); p1.font.bold = True
             p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
             p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
 
-            # 右上：圖
-            img_left = Inches(5.5); img_top = Inches(0.5); img_height = Inches(4.0); img_width = Inches(7.0)
+            # 右上：圖文共存 (修正版)
+            img_left = Inches(5.5); img_top = Inches(0.5); img_width = Inches(7.0)
+            
             if data['image_data']:
+                # 有圖：圖在上 (高3吋)，文在下 (高1吋)
+                # 1. 圖片
+                img_height = Inches(3.0) 
                 slide.shapes.add_picture(BytesIO(data['image_data']), img_left, img_top, height=img_height)
+                
+                # 2. 文字 (圖片下方)
+                text_top = Inches(3.6) # 0.5 + 3.0 + buffer
+                text_height = Inches(1.0)
+                txBox = slide.shapes.add_textbox(img_left, text_top, img_width, text_height)
+                tf = txBox.text_frame; tf.word_wrap = True
+                content = data['rep_fig_text'] if data['rep_fig_text'].strip() else ""
+                for line in content.split('\n'):
+                    if line.strip():
+                        p = tf.add_paragraph(); p.text = line.strip(); p.font.size = Pt(14) # 字體稍縮小以容納
             else:
+                # 沒圖：原本的文字框填滿右上角
+                img_height = Inches(4.0)
                 txBox = slide.shapes.add_textbox(img_left, img_top, img_width, img_height)
                 tf = txBox.text_frame; tf.word_wrap = True
                 content = data['rep_fig_text'] if data['rep_fig_text'].strip() else "無代表圖資訊"
@@ -494,7 +484,7 @@ else:
                 for claim_lines in claims_groups:
                     slide_c = prs.slides.add_slide(prs.slide_layouts[6])
                     
-                    # 2.1 左上 (同步條列式)
+                    # 2.1 左上
                     left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
                     txBox = slide_c.shapes.add_textbox(left, top, width, height)
                     tf = txBox.text_frame; tf.word_wrap = True
@@ -502,7 +492,7 @@ else:
                     p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
                     p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
                     
-                    # 2.2 中間：Claim 內容
+                    # 2.2 中間：Claim
                     left, top, width, height = Inches(0.5), Inches(2.5), Inches(12.3), Inches(4.5)
                     txBox = slide_c.shapes.add_textbox(left, top, width, height)
                     tf = txBox.text_frame; tf.word_wrap = True
