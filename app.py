@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (智慧抓圖版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (智慧抓圖版)")
-st.caption("修正：加入「圖片密度偵測」，自動跳過文字過多的附圖說明頁，精準捕捉工程圖。")
+st.set_page_config(page_title="PPT 重組生成器 (終極抓圖版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (模糊搜尋抓圖版)")
+st.caption("修正：採用「超級正規化」技術，解決 PDF 文字破碎導致的缺圖問題。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -78,76 +78,71 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 函數：搜尋 PDF 截圖 (新增：文字密度檢查) ---
+# --- 函數：搜尋 PDF 截圖 (核心修正：模糊搜尋) ---
 def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
     if not target_fig_text:
         return None, "Word 中未指定代表圖文字"
     try:
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
         
-        # 1. 抓出圖號
+        # 1. 從 Word 抓出純數字/英文 (例如 "3E")
+        # 支援 FIG. 3E, Figure 3E, 图 3E
         number_match = re.search(r'(?:FIG\.?|Figure|图|圖)\s*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
-        target_numbers = []
+        target_number = ""
         if number_match:
-            target_numbers.append(number_match.group(1))
+            target_number = number_match.group(1).strip().upper()
         else:
+            # 備用：抓第一行前幾個字
             first_line = target_fig_text.split('\n')[0].strip()
             if first_line:
                 clean = re.sub(r'^(FIG\.?|Figure|图|圖)[:：\s]*', '', first_line, flags=re.IGNORECASE)
-                target_numbers.append(clean[:5])
+                target_number = clean[:5].upper()
 
-        if not target_numbers:
+        if not target_number:
             return None, "無法識別圖號"
 
-        target_number = target_numbers[0].strip()
-
-        # 2. 建立搜尋關鍵字
+        # 2. 建立「超級正規化」的搜尋關鍵字
+        # 只要 PDF 頁面內容「壓縮後」包含這些字串，就算命中
         search_candidates = [
-            f"FIG.{target_number}", f"FIG{target_number}", f"FIGURE{target_number}",
-            f"图{target_number}", f"圖{target_number}", f"FIG {target_number}",
-            f"图 {target_number}", f"圖 {target_number}"
+            f"FIG{target_number}",    # FIG3E
+            f"FIGURE{target_number}", # FIGURE3E
+            f"图{target_number}",     # 图3E
+            f"圖{target_number}"      # 圖3E
         ]
-        normalized_candidates = [c.replace(" ", "").upper() for c in search_candidates]
-
-        # 3. 關鍵字黑名單 (標題頁)
-        skip_keywords = ["附图说明", "BRIEF DESCRIPTION", "具体实施方式", "DETAILED DESCRIPTION", "DESCRIPTION OF DRAWINGS"]
+        
+        # 3. 定義跳過關鍵字 (壓縮格式)
+        skip_keywords = ["附图说明", "BRIEFDESCRIPTION", "具体实施方式", "DETAILEDDESCRIPTION"]
 
         found_page_index = None
         matched_keyword_log = ""
 
         # 4. 遍歷 PDF
         for i, page in enumerate(doc):
-            page_text = page.get_text()
-            upper_page_text = page_text.upper()
+            # 取得頁面純文字 (移除所有空格、換行)
+            raw_text = page.get_text()
+            compressed_text = re.sub(r'\s+', '', raw_text).upper() # 關鍵：移除所有空白符號
             
-            # A. 關鍵字黑名單檢查
+            # A. 檢查是否為文字說明頁
             should_skip = False
             for skip_kw in skip_keywords:
-                if skip_kw in page_text or skip_kw.upper() in upper_page_text:
+                if skip_kw in compressed_text:
                     should_skip = True
                     break
             if should_skip:
                 continue
 
-            # B. 關鍵字命中檢查
-            clean_text = upper_page_text.replace(" ", "").replace("\n", "")
-            is_hit = False
-            hit_kw = ""
-            for candidate in normalized_candidates:
-                if candidate in clean_text:
-                    is_hit = True
-                    hit_kw = candidate
+            # B. 比對關鍵字
+            for candidate in search_candidates:
+                if candidate in compressed_text:
+                    # C. 進階檢查：這一頁真的有圖片嗎？
+                    # 避免抓到只有文字標題的目錄頁
+                    # (get_images 會回傳頁面中的圖片列表)
+                    # if page.get_images(): # 有圖片才算 -> 這個條件有時太嚴格，先註解掉
+                    found_page_index = i
+                    matched_keyword_log = candidate
                     break
             
-            if is_hit:
-                # C. [核心修正] 文字密度檢查
-                # 如果這一頁文字太多 (例如超過 500 字)，通常是說明頁而非圖片頁
-                # 真正的圖片頁通常只有圖號和少量元件編號，字數很少
-                if len(page_text) > 500:
-                    continue # 這一頁字太多了，雖然有 "FIG. 3E"，但應該是說明文字，跳過！
-                
-                found_page_index = i
-                matched_keyword_log = hit_kw
+            if found_page_index is not None:
                 break
 
         if found_page_index is not None:
@@ -156,15 +151,14 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
             pix = page.get_pixmap(matrix=mat)
             return pix.tobytes("png"), f"成功 (匹配: {matched_keyword_log})"
             
-        return None, f"PDF 中找不到適合的圖號頁面 (搜尋: {target_number})"
+        return None, f"PDF 中找不到對應圖號 (搜尋: {target_number}, 模式: 模糊比對)"
 
     except Exception as e:
         return None, f"PDF 解析發生錯誤: {str(e)}"
 
-# --- 函數：提取專利號 ---
+# --- 函數：提取專利號 (保持上一版正確邏輯) ---
 def extract_patent_number_from_text(text):
     clean_text = text.replace("：", ":").replace(" ", "")
-    # 保留上一版正確的 Regex
     match = re.search(r'([a-zA-Z]{2,4}\d{4}[/]?\d+[a-zA-Z0-9]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
     if match: return match.group(1)
     return ""
@@ -351,7 +345,6 @@ with st.sidebar:
         pdf_file_map = {}
         if pdf_files:
             for pf in pdf_files:
-                # 保留原始檔名供參考，比對時會正規化
                 pdf_file_map[pf.name] = pf.read()
 
         match_count = 0
