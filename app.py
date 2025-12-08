@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (排版與診斷修正)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (排版與診斷修正版)")
-st.caption("修正：診斷報告顯示清洗後的案號與公司、PPT左上角改為三行條列式排版。")
+st.set_page_config(page_title="PPT 重組生成器 (精準欄位版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (精準欄位版)")
+st.caption("修正：精準提取公司名稱、案號格式保留斜線、PPT排版優化。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -120,47 +120,75 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
     except Exception as e:
         return None, f"PDF 解析發生錯誤: {str(e)}"
 
-# --- 新增：Header 資訊提取函數 (精準抓取 案號/日期/公司) ---
-def extract_header_info(raw_text):
+# --- 函數：提取專利號 (用於比對與排序) ---
+def extract_patent_number_from_text(text):
+    # 移除標籤，保留原始格式以便 regex 抓取
+    clean_text = text.replace("：", ":")
+    # 抓取常見專利號格式 (含斜線)
+    match = re.search(r'([a-zA-Z]{2}\s?\d{4}[/]\d+[A-Z0-9\s]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
+    if match:
+        # 回傳時移除空白，但保留斜線
+        return match.group(1).replace(" ", "") 
+    return ""
+
+# --- 函數：提取公司/申請人 (修正版) ---
+def extract_company_for_sort(text):
     """
-    從 Word 的標題段落中，精準提取出 案號、日期、公司。
-    處理格式如: "1. 案號/日期/公司 : 公開號: US 123 日期: 2021.1.1 公司: ABC Corp"
+    從文字中提取公司名稱，並過濾掉標題行中的公司標籤。
+    """
+    lines = text.split('\n')
+    found_companies = []
+    
+    for line in lines:
+        if "公司" in line or "申請人" in line:
+            # 如果這行同時有 "案號" 或 "公開號"，通常是標題行，跳過
+            if "案號" in line or "公開號" in line:
+                continue
+            
+            # 提取內容
+            val = line.replace("公司", "").replace("申請人", "").replace("：", "").replace(":", "").strip()
+            if len(val) > 1:
+                found_companies.append(val)
+    
+    if found_companies:
+        return found_companies[0] # 回傳第一個找到的有效公司名
+    return "ZZZ"
+
+# --- 函數：提取 Header 資訊 (診斷報告與PPT用) ---
+def extract_header_info_detail(raw_text):
+    """
+    回傳 (clean_number, clean_date, clean_company)
     """
     number = "(未找到)"
     date = "(未找到)"
     company = "(未找到)"
     
     # 1. 提取案號 (公開號)
-    # Regex 邏輯: 找 "公開號" 後面的內容，直到遇到 "日期"、"公司" 或 換行
-    # [\s:：]* -> 容許冒號和空白
-    # ([a-zA-Z0-9\s/,]+?) -> 抓取英數字、斜線、逗號
-    match_no = re.search(r'公開號[:：\s]*([a-zA-Z0-9\s/,]+?)(?=\s*日期|\s*公司|\n|$)', raw_text)
+    # 找 "公開號:" 後面的字串
+    match_no = re.search(r'公開號[:：\s]*([^\n]+)', raw_text)
     if match_no:
-        number = match_no.group(1).strip()
-    else:
-        # 備用：如果沒有寫"公開號"三個字，嘗試抓第一個像案號的字串
-        match_backup = re.search(r'([A-Z]{2}\s?[0-9/]+(?:\s?[A-Z][0-9]?)?)', raw_text)
-        if match_backup:
-            number = match_backup.group(1).strip()
+        raw_no = match_no.group(1)
+        # 截斷後面的 "日期" 或 "公司"
+        if "日期" in raw_no: raw_no = raw_no.split("日期")[0]
+        if "公司" in raw_no: raw_no = raw_no.split("公司")[0]
+        
+        # 格式清洗: 移除空白、逗號，保留斜線
+        number = raw_no.strip().replace(" ", "").replace(",", "")
 
     # 2. 提取日期
     match_date = re.search(r'(\d{4}[./-]\d{1,2}[./-]\d{1,2})', raw_text)
     if match_date:
         date = match_date.group(1).strip()
 
-    # 3. 提取公司
-    # 找 "公司" 或 "申請人" 後面的內容
-    match_comp = re.search(r'(?:公司|申請人)[:：\s]*([^\n]+)', raw_text)
-    if match_comp:
-        # 如果抓到的公司名稱後面還有 "日期" 或 "公開號" (順序顛倒的情況)，要截斷
-        raw_comp = match_comp.group(1).strip()
-        # 簡單過濾：如果公司名稱裡包含了 "公開號" 或 "日期"，就切掉
-        if "公開號" in raw_comp:
-            raw_comp = raw_comp.split("公開號")[0].strip()
-        if "日期" in raw_comp:
-            raw_comp = raw_comp.split("日期")[0].strip()
-        company = raw_comp
-
+    # 3. 提取公司 (邏輯同排序函數)
+    lines = raw_text.split('\n')
+    for line in lines:
+        if ("公司" in line or "申請人" in line) and not ("案號" in line or "公開號" in line):
+            val = line.replace("公司", "").replace("申請人", "").replace("：", "").replace(":", "").strip()
+            if len(val) > 1:
+                company = val
+                break
+                
     return number, date, company
 
 # --- 函數：解析 Word 檔案 ---
@@ -168,11 +196,10 @@ def parse_word_file(uploaded_docx):
     try:
         doc = docx.Document(uploaded_docx)
         cases = []
-        # 新增 clean_number, clean_date, clean_company 用於精準顯示
         current_case = {
             "case_info": "", "problem": "", "spirit": "", "key_point": "", "rep_fig_text": "", "claim_text": "",
             "image_data": None, "image_name": "Word匯入", "raw_case_no": "",
-            "clean_number": "", "clean_date": "", "clean_company": "",
+            "clean_number": "", "clean_date": "", "clean_company": "", # 新增欄位
             "sort_date": "99999999", "sort_company": "ZZZ",
             "source_file": uploaded_docx.name, "missing_fields": []
         }
@@ -191,8 +218,8 @@ def parse_word_file(uploaded_docx):
         for text in all_lines:
             if "案號" in text or "索號" in text:
                 if current_case["case_info"] and current_field != "case_info_block":
-                    # 結算上一筆前，先做一次精準提取
-                    nb, dt, cp = extract_header_info(current_case["case_info"])
+                    # 結算前先提取詳細資訊
+                    nb, dt, cp = extract_header_info_detail(current_case["case_info"])
                     current_case["clean_number"] = nb
                     current_case["clean_date"] = dt
                     current_case["clean_company"] = cp
@@ -210,14 +237,16 @@ def parse_word_file(uploaded_docx):
                 current_field = "case_info_block"
                 current_case["case_info"] = text
                 
-                # 初步提取排序用資訊
-                nb, dt, cp = extract_header_info(text)
-                if dt != "(未找到)": 
-                    current_case["sort_date"] = dt.replace(".", "").replace("/", "").replace("-", "")
-                if cp != "(未找到)":
-                    current_case["sort_company"] = cp
-                if nb != "(未找到)":
-                    current_case["raw_case_no"] = nb
+                # 初步提取排序鍵值
+                raw_no = extract_patent_number_from_text(text)
+                if raw_no: current_case["raw_case_no"] = raw_no
+                
+                dt = extract_header_info_detail(text)[1]
+                if dt != "(未找到)": current_case["sort_date"] = dt.replace(".", "").replace("/", "").replace("-", "")
+                
+                cp = extract_company_for_sort(text)
+                if cp != "ZZZ": current_case["sort_company"] = cp
+                
                 continue
 
             if "解決問題" in text:
@@ -244,14 +273,16 @@ def parse_word_file(uploaded_docx):
 
             if current_field == "case_info_block":
                 current_case["case_info"] += "\n" + text
-                # 累加資訊後再次嘗試提取，因為有些資訊可能換行
-                nb, dt, cp = extract_header_info(current_case["case_info"])
-                if dt != "(未找到)": 
-                    current_case["sort_date"] = dt.replace(".", "").replace("/", "").replace("-", "")
-                if cp != "(未找到)":
-                    current_case["sort_company"] = cp
-                if nb != "(未找到)":
-                    current_case["raw_case_no"] = nb
+                # 累加後更新排序鍵值
+                dt = extract_header_info_detail(current_case["case_info"])[1]
+                if dt != "(未找到)": current_case["sort_date"] = dt.replace(".", "").replace("/", "").replace("-", "")
+                
+                cp = extract_company_for_sort(current_case["case_info"])
+                if cp != "ZZZ": current_case["sort_company"] = cp
+                
+                if not current_case["raw_case_no"]:
+                    raw_no = extract_patent_number_from_text(text)
+                    if raw_no: current_case["raw_case_no"] = raw_no
 
             elif current_field == "rep_fig":
                 current_case["rep_fig_text"] += "\n" + text
@@ -265,8 +296,7 @@ def parse_word_file(uploaded_docx):
                 current_case["claim_text"] += "\n" + text
 
         if current_case["case_info"]:
-            # 結算最後一筆
-            nb, dt, cp = extract_header_info(current_case["case_info"])
+            nb, dt, cp = extract_header_info_detail(current_case["case_info"])
             current_case["clean_number"] = nb
             current_case["clean_date"] = dt
             current_case["clean_company"] = cp
@@ -277,7 +307,7 @@ def parse_word_file(uploaded_docx):
         st.error(f"解析 Word 錯誤 ({uploaded_docx.name}): {e}")
         return []
 
-# --- 輔助函數：分割 Claim (維持不變) ---
+# --- 輔助函數：分割 Claim ---
 def split_claims_text(full_text):
     if not full_text: return []
     lines = full_text.split('\n')
@@ -297,7 +327,6 @@ def split_claims_text(full_text):
             
     if current_chunk and "".join(current_chunk).strip():
         claims.append(current_chunk)
-            
     return claims
 
 # --- 側邊欄 ---
@@ -327,7 +356,6 @@ with st.sidebar:
         current_ppt_page = 1 
 
         with st.spinner("處理中..."):
-            # 排序
             all_cases.sort(key=lambda x: (x["sort_company"].upper(), x["sort_date"]))
 
             for case in all_cases:
@@ -348,12 +376,11 @@ with st.sidebar:
                 page_str = f"P{start_page}" if start_page == end_page else f"P{start_page}-P{end_page}"
                 current_ppt_page += pages_this_case
 
-                # 診斷報告：使用清洗過的欄位
                 status = {
                     "來源": case["source_file"], 
-                    "案號(公開號)": case["clean_number"], # 使用清洗後的號碼
-                    "公司": case["clean_company"],       # 使用清洗後的公司
-                    "日期(優先權日)": case["clean_date"], # 使用清洗後的日期
+                    "案號(公開號)": case["clean_number"],
+                    "公司": case["clean_company"],
+                    "日期(優先權日)": case["clean_date"],
                     "對應PPT的頁碼": page_str,
                     "狀態": "未處理", "原因": "", "缺漏": ", ".join(case["missing_fields"])
                 }
@@ -399,9 +426,9 @@ else:
         with cols[i % 3]:
             with st.container(border=True):
                 st.markdown(f"**Case {i+1}**")
-                # 預覽顯示清洗後的資訊
+                # 預覽改用清洗後資訊
                 st.caption(f"{data['clean_company']} | {data['clean_date']}")
-                st.text(f"公開號: {data['clean_number']}") # 預覽只顯示號碼
+                st.text(f"{data['clean_number']}")
                 
                 if data['image_data']: st.image(data['image_data'], use_column_width=True)
                 else: st.warning("無圖片")
@@ -418,26 +445,18 @@ else:
         prs.slide_height = Inches(7.5)
         
         for data in slides_data:
-            # === 第一頁：原本的內容 ===
+            # === 第一頁 ===
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             
-            # 左上：案號 (修正：條列式排版)
+            # 左上：改為條列式排版
             left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
             txBox = slide.shapes.add_textbox(left, top, width, height)
             tf = txBox.text_frame; tf.word_wrap = True
             
-            # 使用清洗後的資訊建立三行
-            p_no = tf.add_paragraph()
-            p_no.text = f"公開號：{data['clean_number']}"
-            p_no.font.size = Pt(20); p_no.font.bold = True
-            
-            p_date = tf.add_paragraph()
-            p_date.text = f"日期：{data['clean_date']}"
-            p_date.font.size = Pt(20); p_date.font.bold = True
-            
-            p_comp = tf.add_paragraph()
-            p_comp.text = f"公司：{data['clean_company']}"
-            p_comp.font.size = Pt(20); p_comp.font.bold = True
+            # 使用清洗後的變數
+            p1 = tf.add_paragraph(); p1.text = f"公開號：{data['clean_number']}"; p1.font.size = Pt(20); p1.font.bold = True
+            p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
+            p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
 
             # 右上：圖
             img_left = Inches(5.5); img_top = Inches(0.5); img_height = Inches(4.0); img_width = Inches(7.0)
@@ -464,26 +483,24 @@ else:
             p = shape.text_frame.paragraphs[0]; p.text = data['key_point']; p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(20); p.font.bold = True
             shape.text_frame.vertical_anchor = MSO_SHAPE.RECTANGLE
 
-            # === Claim 分頁邏輯 (如果勾選) ===
+            # === Claim 分頁 ===
             if need_claim_slide:
                 claims_groups = split_claims_text(data['claim_text'])
-                
                 if not claims_groups and data['claim_text'].strip():
                      claims_groups = [data['claim_text'].split('\n')]
 
                 for claim_lines in claims_groups:
                     slide_c = prs.slides.add_slide(prs.slide_layouts[6])
                     
-                    # 2.1 左上：案號 (同樣使用清洗後資訊)
+                    # 2.1 左上 (同樣改為條列式)
                     left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
                     txBox = slide_c.shapes.add_textbox(left, top, width, height)
                     tf = txBox.text_frame; tf.word_wrap = True
+                    p1 = tf.add_paragraph(); p1.text = f"公開號：{data['clean_number']}"; p1.font.size = Pt(20); p1.font.bold = True
+                    p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
+                    p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
                     
-                    p_no = tf.add_paragraph(); p_no.text = f"公開號：{data['clean_number']}"; p_no.font.size = Pt(20); p_no.font.bold = True
-                    p_date = tf.add_paragraph(); p_date.text = f"日期：{data['clean_date']}"; p_date.font.size = Pt(20); p_date.font.bold = True
-                    p_comp = tf.add_paragraph(); p_comp.text = f"公司：{data['clean_company']}"; p_comp.font.size = Pt(20); p_comp.font.bold = True
-                    
-                    # 2.2 中間：Claim 內容 (保留縮排)
+                    # 2.2 中間：Claim 內容
                     left, top, width, height = Inches(0.5), Inches(2.5), Inches(12.3), Inches(4.5)
                     txBox = slide_c.shapes.add_textbox(left, top, width, height)
                     tf = txBox.text_frame; tf.word_wrap = True
@@ -501,7 +518,6 @@ else:
                             p.font.size = Pt(14) 
                             p.space_after = Pt(4)
                             
-                            # 縮排判斷
                             if line.startswith('\t') or line.startswith('    '):
                                 p.level = 1
                             elif clean_line.startswith(('o ', '○', '-', '•', '●')):
