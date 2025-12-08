@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (檔名配對修復版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (檔名配對修復版)")
-st.caption("修正：強化 PDF 檔名配對邏輯 (自動忽略斜線/空格)，解決「無PDF」誤判問題。")
+st.set_page_config(page_title="PPT 重組生成器 (智慧抓圖版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (智慧抓圖版)")
+st.caption("修正：加入「圖片密度偵測」，自動跳過文字過多的附圖說明頁，精準捕捉工程圖。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -78,7 +78,7 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 函數：搜尋 PDF 截圖 ---
+# --- 函數：搜尋 PDF 截圖 (新增：文字密度檢查) ---
 def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
     if not target_fig_text:
         return None, "Word 中未指定代表圖文字"
@@ -101,7 +101,7 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
 
         target_number = target_numbers[0].strip()
 
-        # 2. 建立搜尋關鍵字 (包含中文/英文)
+        # 2. 建立搜尋關鍵字
         search_candidates = [
             f"FIG.{target_number}", f"FIG{target_number}", f"FIGURE{target_number}",
             f"图{target_number}", f"圖{target_number}", f"FIG {target_number}",
@@ -109,7 +109,7 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
         ]
         normalized_candidates = [c.replace(" ", "").upper() for c in search_candidates]
 
-        # 3. 跳過文字頁面
+        # 3. 關鍵字黑名單 (標題頁)
         skip_keywords = ["附图说明", "BRIEF DESCRIPTION", "具体实施方式", "DETAILED DESCRIPTION", "DESCRIPTION OF DRAWINGS"]
 
         found_page_index = None
@@ -120,23 +120,34 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
             page_text = page.get_text()
             upper_page_text = page_text.upper()
             
+            # A. 關鍵字黑名單檢查
             should_skip = False
             for skip_kw in skip_keywords:
                 if skip_kw in page_text or skip_kw.upper() in upper_page_text:
                     should_skip = True
                     break
-            
             if should_skip:
                 continue
 
+            # B. 關鍵字命中檢查
             clean_text = upper_page_text.replace(" ", "").replace("\n", "")
+            is_hit = False
+            hit_kw = ""
             for candidate in normalized_candidates:
                 if candidate in clean_text:
-                    found_page_index = i
-                    matched_keyword_log = candidate
+                    is_hit = True
+                    hit_kw = candidate
                     break
             
-            if found_page_index is not None:
+            if is_hit:
+                # C. [核心修正] 文字密度檢查
+                # 如果這一頁文字太多 (例如超過 500 字)，通常是說明頁而非圖片頁
+                # 真正的圖片頁通常只有圖號和少量元件編號，字數很少
+                if len(page_text) > 500:
+                    continue # 這一頁字太多了，雖然有 "FIG. 3E"，但應該是說明文字，跳過！
+                
+                found_page_index = i
+                matched_keyword_log = hit_kw
                 break
 
         if found_page_index is not None:
@@ -145,18 +156,17 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
             pix = page.get_pixmap(matrix=mat)
             return pix.tobytes("png"), f"成功 (匹配: {matched_keyword_log})"
             
-        return None, f"PDF 中找不到對應圖號 (搜尋: {target_number})"
+        return None, f"PDF 中找不到適合的圖號頁面 (搜尋: {target_number})"
 
     except Exception as e:
         return None, f"PDF 解析發生錯誤: {str(e)}"
 
-# --- 函數：提取專利號 (恢復為精準欄位版的邏輯) ---
+# --- 函數：提取專利號 ---
 def extract_patent_number_from_text(text):
     clean_text = text.replace("：", ":").replace(" ", "")
-    # 支援: US2024/0027812A1, US6421675B1
+    # 保留上一版正確的 Regex
     match = re.search(r'([a-zA-Z]{2,4}\d{4}[/]?\d+[a-zA-Z0-9]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
-    if match:
-        return match.group(1)
+    if match: return match.group(1)
     return ""
 
 # --- 函數：提取詳細 Header 資訊 ---
@@ -165,10 +175,8 @@ def extract_header_info_detail(raw_text):
     date = "(未找到)"
     company = "(未找到)"
     
-    # 1. 案號
     extracted_no = extract_patent_number_from_text(raw_text)
-    if extracted_no:
-        number = extracted_no
+    if extracted_no: number = extracted_no
     else:
         match_no = re.search(r'(?:公開號|案號)[:：\s]*([^\n]+)', raw_text)
         if match_no:
@@ -176,16 +184,12 @@ def extract_header_info_detail(raw_text):
             raw_no = re.split(r'\s+(?:日期|公司|申請人)[:：]', raw_no)[0]
             number = raw_no.strip()
 
-    # 2. 日期
     match_date = re.search(r'(?:日期)[:：\s]*(\d{4}[./-]\d{1,2}[./-]\d{1,2})', raw_text)
-    if match_date:
-        date = match_date.group(1).strip()
+    if match_date: date = match_date.group(1).strip()
     else:
         match_date_backup = re.search(r'(\d{4}[./-]\d{1,2}[./-]\d{1,2})', raw_text)
-        if match_date_backup:
-            date = match_date_backup.group(1).strip()
+        if match_date_backup: date = match_date_backup.group(1).strip()
 
-    # 3. 公司
     matches = re.findall(r'(?:公司|申請人)[:：\s]*(.*?)(?=\s+(?:公開號|案號|日期)[:：]|$)', raw_text)
     if matches:
         for candidate in reversed(matches):
@@ -205,13 +209,11 @@ def extract_date_for_sort(text):
 # --- 函數：提取公司 (排序用) ---
 def extract_company_for_sort(text):
     _, _, comp = extract_header_info_detail(text)
-    if comp != "(未找到)":
-        return comp
+    if comp != "(未找到)": return comp
     return "ZZZ"
 
-# --- 函數：正規化字串 (用於檔名比對) ---
+# --- 函數：正規化字串 ---
 def normalize_string(s):
-    """移除所有非英數字元，轉大寫，用於寬鬆比對"""
     if not s: return ""
     return re.sub(r'[^A-Z0-9]', '', s.upper())
 
@@ -349,7 +351,7 @@ with st.sidebar:
         pdf_file_map = {}
         if pdf_files:
             for pf in pdf_files:
-                # 這裡不進行過度清洗，保留完整檔名以供 Key 使用，但比對時會正規化
+                # 保留原始檔名供參考，比對時會正規化
                 pdf_file_map[pf.name] = pf.read()
 
         match_count = 0
@@ -360,7 +362,6 @@ with st.sidebar:
                 case_key = case["raw_case_no"]
                 target_fig = case["rep_fig_text"]
                 
-                # 計算頁碼
                 pages_this_case = 1 
                 if add_claim_slide:
                     c_groups = split_claims_text(case["claim_text"])
@@ -382,20 +383,14 @@ with st.sidebar:
                 }
                 
                 matched_pdf = None
-                # === 關鍵修正：智慧檔名比對 ===
-                # 將 Word 案號正規化 (移除符號)
                 norm_case_key = normalize_string(case_key)
                 
                 for pdf_name, pdf_bytes in pdf_file_map.items():
-                    # 將 PDF 檔名正規化
                     norm_pdf_name = normalize_string(pdf_name)
-                    # 只要正規化後的字串有包含關係，就算配對成功
                     if norm_case_key and ((norm_case_key in norm_pdf_name) or (norm_pdf_name in norm_case_key)):
-                        # 避免太短的數字誤判 (例如案號 '123' 對到 '12345.pdf')
                         if len(norm_case_key) > 5:
                             matched_pdf = pdf_bytes
                             break
-                # ============================
                 
                 if matched_pdf:
                     img_data, msg = extract_specific_figure_from_pdf(matched_pdf, target_fig)
