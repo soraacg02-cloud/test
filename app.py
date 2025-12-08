@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 ", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器")
-st.caption("提醒：PDF功能 還無法使用")
+st.set_page_config(page_title="PPT 重組生成器 (診斷優化版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (診斷報告優化版)")
+st.caption("修正：診斷報告欄位更新、案號格式清洗、新增 PPT 頁碼對應欄位。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -29,7 +29,7 @@ nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不�
 5. 代表圖：*(根據發明精神建議3張最可以說明發明精神的圖片，範例:FIG.3)
 6. 獨立項claim： *(分組且分行條列式+對應的代表圖，claim要(1)有位階縮排 (2)claim的元件要有標號 (3)對應的claim號碼)"""
 
-st.info("💡 **NBLM 使用提示詞** (點擊下方綠色按鈕一鍵複製)")
+st.info("💡 **NBLM 使用提示詞** (已更新，點擊下方綠色按鈕一鍵複製)")
 
 components.html(
     f"""
@@ -120,12 +120,29 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
     except Exception as e:
         return None, f"PDF 解析發生錯誤: {str(e)}"
 
-# --- 函數：提取專利號 ---
+# --- 函數：提取專利號 (用於排序/比對) ---
 def extract_patent_number_from_text(text):
     clean_text = text.replace("：", ":").replace(" ", "")
     match = re.search(r'([a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
     if match: return match.group(1)
     return ""
+
+# --- 函數：清洗並格式化案號 (用於診斷報告顯示) ---
+def format_case_no_for_report(full_text):
+    """
+    從整段文字中抓出 '公開號：xxxxx'，並移除空白、逗號、斜線。
+    例如: "公開號: US 2024/0027812 A1" -> "US20240027812A1"
+    """
+    lines = full_text.split('\n')
+    for line in lines:
+        if "公開號" in line or "案號" in line:
+            # 1. 移除標籤
+            val = line.replace("公開號", "").replace("案號", "").replace("：", "").replace(":", "").strip()
+            # 2. 移除干擾符號 (空格, 逗號, 斜線)
+            val = val.replace(" ", "").replace(",", "").replace("/", "")
+            if val:
+                return val
+    return "(無法辨識)"
 
 # --- 函數：提取日期 (排序用) ---
 def extract_date_for_sort(text):
@@ -233,47 +250,30 @@ def parse_word_file(uploaded_docx):
         st.error(f"解析 Word 錯誤 ({uploaded_docx.name}): {e}")
         return []
 
-# --- 輔助函數：分割 Claim (嚴格修正版) ---
+# --- 輔助函數：分割 Claim (智慧切割邏輯) ---
 def split_claims_text(full_text):
-    """
-    分割依據：
-    1. "(Claim 數字)" -> 這是您的 Word 中標題的特徵 (例如 '• ... (Claim 1)')
-    2. 行首 "Claim 數字"
-    3. 行首 "獨立項 數字"
-    4. 行首 "數字. " (排除內文中可能出現的數字)
-    """
     if not full_text: return []
-    
     lines = full_text.split('\n')
     claims = []
     current_chunk = []
     
-    # 關鍵修正：
-    # 1. \(Claim\s*\d+\) -> 抓取夾在中間的 (Claim 1)
-    # 2. ^\s*(Claim|獨立項)\s*\d+ -> 抓取行首的 Claim 1
-    # 3. ^\s*\d+\.\s -> 抓取行首的 1. (注意後面的空格，避免抓到 1.5mm)
     header_pattern = re.compile(r'(\(Claim\s*\d+\)|^\s*(Claim|獨立項)\s*\d+|^\s*\d+\.\s)', re.IGNORECASE)
     
     for line in lines:
-        # 如果這一行符合標題特徵
         if header_pattern.search(line):
             if current_chunk:
-                claims.append(current_chunk)
+                # 存入上一組 (過濾掉純空白組)
+                if "".join(current_chunk).strip():
+                    claims.append(current_chunk)
             current_chunk = [line]
         else:
             current_chunk.append(line)
             
-    if current_chunk:
+    # 存最後一組
+    if current_chunk and "".join(current_chunk).strip():
         claims.append(current_chunk)
-    
-    # 過濾空資料
-    valid_claims = []
-    for chunk in claims:
-        chunk_str = "".join(chunk).strip()
-        if len(chunk_str) > 2:
-            valid_claims.append(chunk)
             
-    return valid_claims
+    return claims
 
 # --- 側邊欄 ---
 with st.sidebar:
@@ -289,23 +289,53 @@ with st.sidebar:
         all_cases = []
         status_report_list = []
         
+        # 1. 解析 Word
         for wf in word_files:
             all_cases.extend(parse_word_file(wf))
         
+        # 2. 準備 PDF
         pdf_file_map = {}
         if pdf_files:
             for pf in pdf_files:
                 clean = re.sub(r'[^a-zA-Z0-9]', '', pf.name.rsplit('.', 1)[0])
                 pdf_file_map[clean] = pf.read()
 
+        # 3. 先排序 (重要：為了計算正確的連續頁碼)
+        all_cases.sort(key=lambda x: (x["sort_company"].upper(), x["sort_date"]))
+
+        # 4. 處理圖片 + 產生診斷報告 (含頁碼計算)
         match_count = 0
+        current_ppt_page = 1 # 頁碼計數器
+
         with st.spinner("處理中..."):
             for case in all_cases:
                 case_key = case["raw_case_no"]
                 target_fig = case["rep_fig_text"]
+                
+                # --- 計算頁碼 ---
+                # 每個案子基本 1 頁
+                pages_this_case = 1 
+                if add_claim_slide:
+                    # 計算 Claim 組數
+                    c_groups = split_claims_text(case["claim_text"])
+                    if not c_groups and case["claim_text"].strip():
+                        # 若沒分出組但有字，算 1 頁
+                        pages_this_case += 1
+                    else:
+                        pages_this_case += len(c_groups)
+                
+                start_page = current_ppt_page
+                end_page = current_ppt_page + pages_this_case - 1
+                page_str = f"P{start_page}" if start_page == end_page else f"P{start_page}-P{end_page}"
+                current_ppt_page += pages_this_case # 更新計數器給下一案用
+                # ----------------
+
                 status = {
-                    "來源": case["source_file"], "案號": case_key if case_key else "?",
-                    "公司": case["sort_company"], "日期": case["sort_date"],
+                    "來源": case["source_file"], 
+                    "案號(公開號)": format_case_no_for_report(case["case_info"]), # 使用清洗函數
+                    "公司": case["sort_company"], 
+                    "日期(優先權日)": case["sort_date"],
+                    "對應PPT的頁碼": page_str, # 新增頁碼欄位
                     "狀態": "未處理", "原因": "", "缺漏": ", ".join(case["missing_fields"])
                 }
                 
@@ -325,9 +355,6 @@ with st.sidebar:
                     if not target_fig: status["狀態"] = "⚠️ 缺資訊"; status["原因"] = "Word無代表圖"
                     else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key}"
                 status_report_list.append(status)
-
-        all_cases.sort(key=lambda x: (x["sort_company"].upper(), x["sort_date"]))
-        status_report_list.sort(key=lambda x: (x["公司"].upper(), x["日期"]))
 
         if all_cases:
             st.session_state['slides_data'] = all_cases
@@ -361,7 +388,7 @@ else:
                 full_claim_text = data['claim_text']
                 claims_preview = split_claims_text(full_claim_text)
                 count_claims = len(claims_preview) if full_claim_text else 0
-                st.caption(f"Claim: {count_claims} 組 (預計 {count_claims} 頁)")
+                st.caption(f"Claim: {count_claims} 組")
 
     # --- PPT 生成邏輯 ---
     def generate_ppt(slides_data, need_claim_slide):
@@ -444,17 +471,13 @@ else:
                             p.space_after = Pt(4)
                             
                             # === 關鍵縮排對應 (針對您的截圖) ===
-                            # Level 0 (標題): 包含 (Claim X) 或黑點開頭
                             if "(Claim" in line or "獨立項" in line or clean_line.startswith(('•', '●')):
                                 p.level = 0
                                 p.font.bold = True
-                            # Level 1: 空心圓 o, ○
                             elif clean_line.startswith(('o ', '○', 'O ')):
                                 p.level = 1
-                            # Level 2: 實心方塊 ▪, ■
                             elif clean_line.startswith(('▪', '■')):
                                 p.level = 2
-                            # Level 1: 減號 -, 數字 1.
                             elif clean_line.startswith(('- ', '1.', '2.')):
                                 p.level = 1
 
@@ -471,4 +494,7 @@ else:
     st.divider()
     st.subheader("📊 診斷報告")
     if st.session_state['status_report']:
-        st.dataframe(pd.DataFrame(st.session_state['status_report']), hide_index=True)
+        df = pd.DataFrame(st.session_state['status_report'])
+        # 強制指定欄位順序
+        cols = ["來源", "案號(公開號)", "公司", "日期(優先權日)", "對應PPT的頁碼", "狀態", "原因", "缺漏"]
+        st.dataframe(df[cols], hide_index=True)
