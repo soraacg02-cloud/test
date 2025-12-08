@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (雙層過濾重製版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (雙層過濾重製版)")
-st.caption("革新：採用「頁面特徵分類」+「極致簡化比對」，徹底解決文字頁誤判與破碎文字缺圖問題。")
+st.set_page_config(page_title="PPT 重組生成器 (短行鎖定版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (短行鎖定版)")
+st.caption("革新：改用「行級別特徵」判斷，只抓取圖號獨立成行的頁面，徹底排除說明書內文。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -78,17 +78,15 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- [全新邏輯] 函數：搜尋 PDF 多張截圖 ---
-def extract_images_from_pdf_v2(pdf_stream, target_fig_text):
+# --- 函數：搜尋 PDF 多張截圖 (核心：V3 短行鎖定邏輯) ---
+def extract_images_from_pdf_v3(pdf_stream, target_fig_text):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
     
     try:
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
         
-        # 1. 解析 Word 中的目標圖號 (列表)
-        # 例如: "FIG. 2, FIG. 3, FIG. 6" -> ['2', '3', '6']
-        # 例如: "圖1B, 圖2B" -> ['1B', '2B']
+        # 1. 解析 Word 中的目標圖號
         matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
         
         # 備用：若 regex 失敗，嘗試抓第一行
@@ -104,50 +102,21 @@ def extract_images_from_pdf_v2(pdf_stream, target_fig_text):
         # 去重並排序
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # 2. [第一層過濾] 篩選出「可能是圖片頁」的頁面索引
-        # 排除掉字數過多、包含說明書標題的頁面
-        candidate_pages = []
-        
-        text_page_keywords = [
+        # 2. 定義「絕對文字頁」的標題 (碰到這些標題就整頁跳過)
+        page_blacklist_headers = [
             "BRIEF DESCRIPTION", "DETAILED DESCRIPTION", "具体实施方式", "實施方式", 
             "WHAT IS CLAIMED", "权利要求", "申請專利範圍",
             "ABSTRACT", "摘要", "BACKGROUND", "背景技術",
             "符号说明", "符號說明"
         ]
 
-        for i, page in enumerate(doc):
-            raw_text = page.get_text("text")
-            upper_text = raw_text.upper()
-            
-            # A. 字數過濾：圖片頁通常字數很少 (圖號+元件符號)
-            # 設定寬鬆一點的門檻，例如 800 字 (有些複雜電路圖字也多)
-            if len(raw_text) > 1000: 
-                continue
-
-            # B. 標題黑名單過濾
-            is_text_page = False
-            for kw in text_page_keywords:
-                if kw in upper_text:
-                    is_text_page = True
-                    break
-            if is_text_page: 
-                continue
-            
-            # 通過初選，加入候選名單
-            # 同時預先計算出「極致簡化字串」加速比對
-            # 移除所有非英數字和中文: "F I G . 2" -> "FIG2"
-            clean_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', upper_text)
-            candidate_pages.append({
-                "index": i,
-                "clean_text": clean_text
-            })
-
-        # 3. [第二層過濾] 在候選頁中尋找圖號
         found_page_indices = set()
         log_found = []
 
+        # 3. 遍歷每一個目標圖號
         for target_number in target_numbers:
-            # 建立搜尋 Token
+            
+            # 建立搜尋 Token (超級正規化)
             search_tokens = [
                 f"FIG{target_number}", 
                 f"FIGURE{target_number}",
@@ -155,26 +124,59 @@ def extract_images_from_pdf_v2(pdf_stream, target_fig_text):
                 f"圖{target_number}"
             ]
             
-            found_this = False
-            for cand in candidate_pages:
-                page_text = cand["clean_text"]
-                page_idx = cand["index"]
-                
-                for token in search_tokens:
-                    if token in page_text:
-                        # 找到命中！
-                        found_page_indices.add(page_idx)
-                        log_found.append(target_number)
-                        found_this = True
-                        break # 跳出 Token 迴圈
-                
-                if found_this:
-                    break # 找到這個圖號的一頁即可，跳出頁面迴圈，找下一個圖號
+            found_this_fig = False
+
+            for i, page in enumerate(doc):
+                # 取得頁面文字區塊 (Blocks)，這樣可以逐行分析
+                # blocks 格式: (x0, y0, x1, y1, "text", block_no, block_type)
+                blocks = page.get_text("blocks")
+                page_text_all = "".join([b[4] for b in blocks]).upper()
+
+                # A. [頁級別過濾] 檢查黑名單標題
+                is_text_page = False
+                for header in page_blacklist_headers:
+                    if header in page_text_all:
+                        is_text_page = True
+                        break
+                if is_text_page: 
+                    continue
+
+                # B. [行級別比對] 檢查每一行文字
+                # 我們要找的是: 包含圖號，且該行文字很短的 Block
+                for b in blocks:
+                    block_text = b[4].strip()
+                    # 正規化該行文字 (去空、轉大寫)
+                    clean_block_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', block_text).upper()
+                    
+                    for token in search_tokens:
+                        # 檢查 1: Token 是否存在於該行
+                        if token in clean_block_text:
+                            # 檢查 2: [核心邏輯] 該行文字長度是否很短?
+                            # 圖片標題通常很短 (e.g., "FIG. 3E" 或 "图 3E")
+                            # 說明書內文通常很長 (e.g., "參照圖3E所示...")
+                            # 設定門檻：30 個字元 (容許一些雜訊)
+                            if len(clean_block_text) < 30:
+                                # 檢查 3: 邊界檢查 (避免 FIG2 抓到 FIG20)
+                                idx = clean_block_text.find(token)
+                                is_exact_match = True
+                                if idx != -1:
+                                    after_idx = idx + len(token)
+                                    if after_idx < len(clean_block_text):
+                                        if clean_block_text[after_idx].isdigit():
+                                            is_exact_match = False
+                                
+                                if is_exact_match:
+                                    found_page_indices.add(i)
+                                    log_found.append(target_number)
+                                    found_this_fig = True
+                                    break
+                    
+                    if found_this_fig: break
+                if found_this_fig: break
         
         if not found_page_indices:
-            return [], f"找不到圖號: {', '.join(target_numbers)} (已搜尋 {len(candidate_pages)} 張候選頁)"
+            return [], f"找不到圖號: {', '.join(target_numbers)}"
 
-        # 4. 截圖回傳
         output_images = []
         for page_idx in sorted(list(found_page_indices)):
             page = doc[page_idx]
@@ -237,7 +239,7 @@ def extract_company_for_sort(text):
     if comp != "(未找到)": return comp
     return "ZZZ"
 
-# --- 函數：正規化字串 (用於檔名比對) ---
+# --- 函數：正規化字串 ---
 def normalize_string(s):
     if not s: return ""
     return re.sub(r'[^A-Z0-9]', '', s.upper())
@@ -417,8 +419,7 @@ with st.sidebar:
                             break
                 
                 if matched_pdf:
-                    # 使用新的 v2 函數
-                    img_list, msg = extract_images_from_pdf_v2(matched_pdf, target_fig)
+                    img_list, msg = extract_images_from_pdf_v3(matched_pdf, target_fig)
                     if img_list:
                         case["image_list"] = img_list
                         status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
@@ -487,7 +488,6 @@ else:
                 num_imgs = len(img_list)
                 img_w = (7.0 / num_imgs) - 0.1
                 img_h = 3.0
-                
                 for idx, img_bytes in enumerate(img_list):
                     this_left = 5.5 + (idx * (img_w + 0.1))
                     slide.shapes.add_picture(BytesIO(img_bytes), Inches(this_left), Inches(0.5), height=Inches(img_h))
