@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (案號修復版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (案號修復版)")
-st.caption("修正：恢復正確的案號提取邏輯，同時保留精準的公司名稱抓取。")
+st.set_page_config(page_title="PPT 重組生成器 (中英圖號對照版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (中英圖號對照版)")
+st.caption("修正：支援 Word(FIG.) 與 PDF(图/圖) 之間的自動對應，解決中文專利缺圖問題。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -78,78 +78,100 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 函數：搜尋 PDF 截圖 ---
+# --- 函數：搜尋 PDF 截圖 (關鍵修正：中英文圖號自動對照) ---
 def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
     if not target_fig_text:
         return None, "Word 中未指定代表圖文字"
     try:
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
-        pattern = re.compile(r'((?:FIG\.?|Figure|圖)\s*[0-9]+[A-Za-z]*)', re.IGNORECASE)
-        search_keywords = []
-        lines = target_fig_text.split('\n')
-        for line in lines:
-            match = pattern.search(line)
-            if match:
-                clean_keyword = match.group(1).replace(" ", "").upper()
-                search_keywords.append(clean_keyword)
         
-        if not search_keywords:
-             first_line = lines[0].strip()
-             if first_line:
-                 search_keywords.append(first_line[:10].replace(" ", "").upper())
+        # 1. 先從 Word 文字中抓出「圖號數字」 (例如從 "FIG. 3E" 抓出 "3E")
+        # 支援格式: FIG.3E, Figure 3E, 图3E, 圖3E
+        number_match = re.search(r'(?:FIG\.?|Figure|图|圖)\s*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
+        
+        target_numbers = []
+        if number_match:
+            target_numbers.append(number_match.group(1)) # 抓到 "3E"
+        else:
+            # 如果 Regex 沒抓到，嘗試抓第一行前幾個字當作備用
+            first_line = target_fig_text.split('\n')[0].strip()
+            if first_line:
+                # 嘗試移除常見前綴
+                clean = re.sub(r'^(FIG\.?|Figure|图|圖)[:：\s]*', '', first_line, flags=re.IGNORECASE)
+                target_numbers.append(clean[:5]) # 取前5個字
 
-        target_keyword = search_keywords[0] if search_keywords else ""
-        if not target_keyword:
-            return None, "無法從說明文字中識別出圖號"
+        if not target_numbers:
+            return None, "無法識別圖號"
+
+        target_number = target_numbers[0].strip() # 例如 "3E"
+
+        # 2. 建立「搜尋關鍵字列表」 (包含 中文/英文/繁體)
+        # 只要 PDF 裡出現這些任何一個，都算找到
+        search_candidates = [
+            f"FIG.{target_number}",   # FIG.3E
+            f"FIG{target_number}",    # FIG3E
+            f"FIGURE{target_number}", # FIGURE3E
+            f"图{target_number}",     # 图3E (簡中)
+            f"圖{target_number}",     # 圖3E (繁中)
+            f"FIG {target_number}",   # FIG 3E (帶空格)
+            f"图 {target_number}",    # 图 3E
+            f"圖 {target_number}"     # 圖 3E
+        ]
+        
+        # 將所有候選字轉大寫並去空白，方便比對
+        normalized_candidates = [c.replace(" ", "").upper() for c in search_candidates]
 
         found_page_index = None
         matched_keyword_log = ""
+
+        # 3. 遍歷 PDF 頁面
         for i, page in enumerate(doc):
-            page_text = page.get_text().replace(" ", "").upper()
-            if target_keyword in page_text:
-                found_page_index = i
-                matched_keyword_log = target_keyword
-                break
-        
+            # 取得頁面文字，轉大寫並去空白
+            page_text = page.get_text().replace(" ", "").replace("\n", "").upper()
+            
+            for candidate in normalized_candidates:
+                if candidate in page_text:
+                    found_page_index = i
+                    matched_keyword_log = candidate
+                    break # 找到一種就跳出
+            
+            if found_page_index is not None:
+                break # 找到頁面就跳出
+
         if found_page_index is not None:
             page = doc[found_page_index]
             mat = fitz.Matrix(2, 2)
             pix = page.get_pixmap(matrix=mat)
-            return pix.tobytes("png"), f"成功"
-        return None, f"PDF 中找不到關鍵字「{target_keyword}」"
+            return pix.tobytes("png"), f"成功 (匹配: {matched_keyword_log})"
+            
+        return None, f"PDF 中找不到對應圖號 (搜尋了: {target_number})"
+
     except Exception as e:
         return None, f"PDF 解析發生錯誤: {str(e)}"
 
-# --- 函數：提取專利號 (恢復為上一版的邏輯) ---
+# --- 函數：提取專利號 ---
 def extract_patent_number_from_text(text):
-    # 移除標籤，保留原始格式以便 regex 抓取
     clean_text = text.replace("：", ":").replace(" ", "")
-    # 抓取常見專利號格式 (含斜線，修正 Regex 以包含完整格式)
-    # 支援: US2024/0027812A1, US6421675B1, TWI529467B
+    # 恢復上一版正確的 Regex，支援斜線
     match = re.search(r'([a-zA-Z]{2,4}\d{4}[/]?\d+[a-zA-Z0-9]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
     if match:
         return match.group(1)
     return ""
 
-# --- 函數：提取詳細 Header 資訊 (診斷報告與PPT用 - 修正版) ---
+# --- 函數：提取詳細 Header 資訊 ---
 def extract_header_info_detail(raw_text):
-    """
-    回傳 (clean_number, clean_date, clean_company)
-    """
     number = "(未找到)"
     date = "(未找到)"
     company = "(未找到)"
     
-    # 1. 提取案號 (公開號) - 使用專門函數提取，確保與 raw_case_no 一致
+    # 1. 提取案號
     extracted_no = extract_patent_number_from_text(raw_text)
     if extracted_no:
         number = extracted_no
     else:
-        # 備用：若專門函數沒抓到，嘗試抓 "公開號:" 後面的內容
         match_no = re.search(r'(?:公開號|案號)[:：\s]*([^\n]+)', raw_text)
         if match_no:
             raw_no = match_no.group(1)
-            # 截斷後續欄位
             raw_no = re.split(r'\s+(?:日期|公司|申請人)[:：]', raw_no)[0]
             number = raw_no.strip()
 
@@ -158,12 +180,11 @@ def extract_header_info_detail(raw_text):
     if match_date:
         date = match_date.group(1).strip()
     else:
-        # 備用：直接找日期格式
         match_date_backup = re.search(r'(\d{4}[./-]\d{1,2}[./-]\d{1,2})', raw_text)
         if match_date_backup:
             date = match_date_backup.group(1).strip()
 
-    # 3. 提取公司 (維持您滿意的邏輯)
+    # 3. 提取公司
     matches = re.findall(r'(?:公司|申請人)[:：\s]*(.*?)(?=\s+(?:公開號|案號|日期)[:：]|$)', raw_text)
     if matches:
         for candidate in reversed(matches):
