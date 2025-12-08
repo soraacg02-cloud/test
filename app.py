@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (強力抓圖修復版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (強力抓圖修復版)")
-st.caption("修正：移除圖片頁字數限制、優化多圖號解析邏輯，解決 TWI/US 案號缺圖問題。")
+st.set_page_config(page_title="PPT 重組生成器 (雙層過濾重製版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (雙層過濾重製版)")
+st.caption("革新：採用「頁面特徵分類」+「極致簡化比對」，徹底解決文字頁誤判與破碎文字缺圖問題。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -29,7 +29,7 @@ nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不�
 5. 代表圖：*(根據發明精神建議3張最可以說明發明精神的圖片，範例:FIG.3)
 6. 獨立項claim： *(分組且分行條列式+對應的代表圖，claim要(1)有位階縮排 (2)claim的元件要有標號 (3)對應的claim號碼)"""
 
-st.info("💡 **NBLM 使用提示詞** (已更新，點擊下方綠色按鈕一鍵複製)")
+st.info("💡 **NBLM 使用提示詞** (點擊下方綠色按鈕一鍵複製)")
 
 components.html(
     f"""
@@ -78,16 +78,17 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 函數：搜尋 PDF 多張截圖 (核心修正：移除字數限制 + 雙軌搜尋) ---
-def extract_images_from_pdf(pdf_stream, target_fig_text):
+# --- [全新邏輯] 函數：搜尋 PDF 多張截圖 ---
+def extract_images_from_pdf_v2(pdf_stream, target_fig_text):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
     
     try:
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
         
-        # 1. 解析目標圖號 (支援逗號分隔, e.g. "圖1B, 圖2B")
-        # Regex: 抓取 "FIG" 或 "圖" 後面的 "數字+字母"
+        # 1. 解析 Word 中的目標圖號 (列表)
+        # 例如: "FIG. 2, FIG. 3, FIG. 6" -> ['2', '3', '6']
+        # 例如: "圖1B, 圖2B" -> ['1B', '2B']
         matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
         
         # 備用：若 regex 失敗，嘗試抓第一行
@@ -103,75 +104,77 @@ def extract_images_from_pdf(pdf_stream, target_fig_text):
         # 去重並排序
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # 2. 定義「純文字說明頁」的特徵 (黑名單)
-        # 只要頁面包含這些標題，就跳過 (不管有沒有 FIG 關鍵字)
-        text_section_headers = [
+        # 2. [第一層過濾] 篩選出「可能是圖片頁」的頁面索引
+        # 排除掉字數過多、包含說明書標題的頁面
+        candidate_pages = []
+        
+        text_page_keywords = [
             "BRIEF DESCRIPTION", "DETAILED DESCRIPTION", "具体实施方式", "實施方式", 
             "WHAT IS CLAIMED", "权利要求", "申請專利範圍",
             "ABSTRACT", "摘要", "BACKGROUND", "背景技術",
             "符号说明", "符號說明"
         ]
-        
+
+        for i, page in enumerate(doc):
+            raw_text = page.get_text("text")
+            upper_text = raw_text.upper()
+            
+            # A. 字數過濾：圖片頁通常字數很少 (圖號+元件符號)
+            # 設定寬鬆一點的門檻，例如 800 字 (有些複雜電路圖字也多)
+            if len(raw_text) > 1000: 
+                continue
+
+            # B. 標題黑名單過濾
+            is_text_page = False
+            for kw in text_page_keywords:
+                if kw in upper_text:
+                    is_text_page = True
+                    break
+            if is_text_page: 
+                continue
+            
+            # 通過初選，加入候選名單
+            # 同時預先計算出「極致簡化字串」加速比對
+            # 移除所有非英數字和中文: "F I G . 2" -> "FIG2"
+            clean_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', upper_text)
+            candidate_pages.append({
+                "index": i,
+                "clean_text": clean_text
+            })
+
+        # 3. [第二層過濾] 在候選頁中尋找圖號
         found_page_indices = set()
         log_found = []
 
-        # 3. 遍歷每一個目標圖號
         for target_number in target_numbers:
-            
-            # 建立搜尋模式
-            # A. 精確模式 (原始文字): 允許 "FIG. 1B", "圖 1B" (有空格)
-            #    Regex: 關鍵字 + 點/空 + 圖號 + 邊界(不能是數字)
-            pattern_strict = re.compile(rf'(?:FIG|FIGURE|图|圖)[\s\.]*{re.escape(target_number)}(?![0-9])', re.IGNORECASE)
-            
-            # B. 暴力模式 (去空文字): "FIG1B", "圖1B"
-            token_loose = [
+            # 建立搜尋 Token
+            search_tokens = [
                 f"FIG{target_number}", 
                 f"FIGURE{target_number}",
                 f"图{target_number}", 
                 f"圖{target_number}"
             ]
             
-            # 遍歷 PDF 每一頁
-            for i, page in enumerate(doc):
-                raw_text = page.get_text("text")
-                upper_text = raw_text.upper()
+            found_this = False
+            for cand in candidate_pages:
+                page_text = cand["clean_text"]
+                page_idx = cand["index"]
                 
-                # --- 修正：不再使用 len(raw_text) > 1000 過濾 ---
-                # 因為複雜的電路圖或結構圖，元件編號(10, 12, 14...)加起來可能很多字
-                # 我們改用「標題黑名單」來過濾
-
-                # [黑名單過濾] 檢查是否為說明書文字頁
-                is_text_page = False
-                for header in text_section_headers:
-                    if header in upper_text:
-                        is_text_page = True
-                        break
-                if is_text_page: 
-                    continue
-
-                # [比對]
-                found_current = False
+                for token in search_tokens:
+                    if token in page_text:
+                        # 找到命中！
+                        found_page_indices.add(page_idx)
+                        log_found.append(target_number)
+                        found_this = True
+                        break # 跳出 Token 迴圈
                 
-                # 策略 1: 精確比對
-                if pattern_strict.search(raw_text):
-                    found_current = True
-                
-                # 策略 2: 暴力比對 (如果策略1沒找到)
-                if not found_current:
-                    compressed_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', raw_text).upper()
-                    for token in token_loose:
-                        if token in compressed_text:
-                            found_current = True
-                            break
-                
-                if found_current:
-                    found_page_indices.add(i)
-                    log_found.append(target_number)
-                    break # 找到這個圖號的一頁即可 (通常圖號只出現在一頁)
+                if found_this:
+                    break # 找到這個圖號的一頁即可，跳出頁面迴圈，找下一個圖號
         
         if not found_page_indices:
-            return [], f"找不到圖號: {', '.join(target_numbers)}"
+            return [], f"找不到圖號: {', '.join(target_numbers)} (已搜尋 {len(candidate_pages)} 張候選頁)"
 
+        # 4. 截圖回傳
         output_images = []
         for page_idx in sorted(list(found_page_indices)):
             page = doc[page_idx]
@@ -187,7 +190,6 @@ def extract_images_from_pdf(pdf_stream, target_fig_text):
 # --- 函數：提取專利號 ---
 def extract_patent_number_from_text(text):
     clean_text = text.replace("：", ":").replace(" ", "")
-    # 支援斜線格式
     match = re.search(r'([a-zA-Z]{2,4}\d{4}[/]?\d+[a-zA-Z0-9]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
     if match: return match.group(1)
     return ""
@@ -374,7 +376,6 @@ with st.sidebar:
         pdf_file_map = {}
         if pdf_files:
             for pf in pdf_files:
-                # 保留原始檔名供參考，比對時會正規化
                 pdf_file_map[pf.name] = pf.read()
 
         match_count = 0
@@ -416,7 +417,8 @@ with st.sidebar:
                             break
                 
                 if matched_pdf:
-                    img_list, msg = extract_images_from_pdf(matched_pdf, target_fig)
+                    # 使用新的 v2 函數
+                    img_list, msg = extract_images_from_pdf_v2(matched_pdf, target_fig)
                     if img_list:
                         case["image_list"] = img_list
                         status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
@@ -471,7 +473,6 @@ else:
         for data in slides_data:
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             
-            # 左上：案號
             left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
             txBox = slide.shapes.add_textbox(left, top, width, height)
             tf = txBox.text_frame; tf.word_wrap = True
@@ -479,12 +480,11 @@ else:
             p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
             p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
 
-            # 右上：多圖排版
+            img_left = Inches(5.5); img_top = Inches(0.5); img_width = Inches(7.0)
             img_list = data.get('image_list', [])
             
             if img_list:
                 num_imgs = len(img_list)
-                # 計算每張圖的寬度，總寬度 7.0
                 img_w = (7.0 / num_imgs) - 0.1
                 img_h = 3.0
                 
@@ -492,25 +492,23 @@ else:
                     this_left = 5.5 + (idx * (img_w + 0.1))
                     slide.shapes.add_picture(BytesIO(img_bytes), Inches(this_left), Inches(0.5), height=Inches(img_h))
                 
-                # 文字在下
                 text_top = Inches(3.6)
                 text_height = Inches(1.0)
-                txBox = slide.shapes.add_textbox(Inches(5.5), text_top, Inches(7.0), text_height)
+                txBox = slide.shapes.add_textbox(img_left, text_top, img_width, text_height)
                 tf = txBox.text_frame; tf.word_wrap = True
                 content = data['rep_fig_text'] if data['rep_fig_text'].strip() else ""
                 for line in content.split('\n'):
                     if line.strip():
                         p = tf.add_paragraph(); p.text = line.strip(); p.font.size = Pt(14)
             else:
-                # 沒圖：純文字
-                txBox = slide.shapes.add_textbox(Inches(5.5), Inches(0.5), Inches(7.0), Inches(4.0))
+                img_height = Inches(4.0)
+                txBox = slide.shapes.add_textbox(img_left, img_top, img_width, img_height)
                 tf = txBox.text_frame; tf.word_wrap = True
                 content = data['rep_fig_text'] if data['rep_fig_text'].strip() else "無代表圖資訊"
                 for line in content.split('\n'):
                     if line.strip():
                         p = tf.add_paragraph(); p.text = line.strip(); p.font.size = Pt(16)
 
-            # 中下 & 底部
             left, top, width, height = Inches(0.5), Inches(4.8), Inches(12.3), Inches(1.5)
             txBox = slide.shapes.add_textbox(left, top, width, height)
             tf = txBox.text_frame; tf.word_wrap = True
@@ -523,7 +521,6 @@ else:
             p = shape.text_frame.paragraphs[0]; p.text = data['key_point']; p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(20); p.font.bold = True
             shape.text_frame.vertical_anchor = MSO_SHAPE.RECTANGLE
 
-            # === Claim 分頁邏輯 ===
             if need_claim_slide:
                 claims_groups = split_claims_text(data['claim_text'])
                 if not claims_groups and data['claim_text'].strip():
