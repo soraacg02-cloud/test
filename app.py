@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (雙重搜尋修復版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (雙重搜尋修復版)")
-st.caption("修正：引入「標準+強力」雙重搜尋機制，解決因文字沾黏導致的誤判，完美兼容 US/CN/TW 各種格式。")
+st.set_page_config(page_title="PPT 重組生成器 (強力抓圖修復版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (強力抓圖修復版)")
+st.caption("修正：移除圖片頁字數限制、優化多圖號解析邏輯，解決 TWI/US 案號缺圖問題。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -78,7 +78,7 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 函數：搜尋 PDF 多張截圖 (核心修正：雙重搜尋) ---
+# --- 函數：搜尋 PDF 多張截圖 (核心修正：移除字數限制 + 雙軌搜尋) ---
 def extract_images_from_pdf(pdf_stream, target_fig_text):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
@@ -86,9 +86,11 @@ def extract_images_from_pdf(pdf_stream, target_fig_text):
     try:
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
         
-        # 1. 解析目標圖號
+        # 1. 解析目標圖號 (支援逗號分隔, e.g. "圖1B, 圖2B")
+        # Regex: 抓取 "FIG" 或 "圖" 後面的 "數字+字母"
         matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
         
+        # 備用：若 regex 失敗，嘗試抓第一行
         if not matches:
             first_line = target_fig_text.split('\n')[0].strip().upper()
             fallback = re.search(r'([0-9]+[A-Z]*)', first_line)
@@ -98,63 +100,75 @@ def extract_images_from_pdf(pdf_stream, target_fig_text):
         if not matches:
             return [], "無法識別任何圖號"
 
+        # 去重並排序
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # 2. 定義跳過關鍵字
-        skip_keywords = ["附图说明", "BRIEF DESCRIPTION", "具体实施方式", "DETAILED DESCRIPTION", 
-                         "DESCRIPTION OF DRAWINGS", "WHAT IS CLAIMED", "权利要求", "申請專利範圍",
-                         "ABSTRACT", "摘要", "BACKGROUND", "背景技術"]
+        # 2. 定義「純文字說明頁」的特徵 (黑名單)
+        # 只要頁面包含這些標題，就跳過 (不管有沒有 FIG 關鍵字)
+        text_section_headers = [
+            "BRIEF DESCRIPTION", "DETAILED DESCRIPTION", "具体实施方式", "實施方式", 
+            "WHAT IS CLAIMED", "权利要求", "申請專利範圍",
+            "ABSTRACT", "摘要", "BACKGROUND", "背景技術",
+            "符号说明", "符號說明"
+        ]
         
         found_page_indices = set()
-        
+        log_found = []
+
+        # 3. 遍歷每一個目標圖號
         for target_number in target_numbers:
             
-            # --- 建立搜尋模式 ---
-            # 模式 A: 標準 Regex (針對原始文字，保留邊界檢查，最安全)
-            # 允許: FIG. 2, FIG 2, 图 2, 图2
-            # 拒絕: FIG 20 (因為有 \b 或非數字斷詞)
-            pattern_standard = re.compile(rf'(?:FIG|FIGURE|图|圖)[\s\.]*{re.escape(target_number)}(?![0-9])', re.IGNORECASE)
+            # 建立搜尋模式
+            # A. 精確模式 (原始文字): 允許 "FIG. 1B", "圖 1B" (有空格)
+            #    Regex: 關鍵字 + 點/空 + 圖號 + 邊界(不能是數字)
+            pattern_strict = re.compile(rf'(?:FIG|FIGURE|图|圖)[\s\.]*{re.escape(target_number)}(?![0-9])', re.IGNORECASE)
             
-            # 模式 B: 超級正規化 (針對破碎文字 F I G . 2)
-            # 不做邊界檢查 (犧牲一點精確度換取找得到)
-            token_super = [
-                f"FIG{target_number}", f"FIGURE{target_number}",
-                f"图{target_number}", f"圖{target_number}"
+            # B. 暴力模式 (去空文字): "FIG1B", "圖1B"
+            token_loose = [
+                f"FIG{target_number}", 
+                f"FIGURE{target_number}",
+                f"图{target_number}", 
+                f"圖{target_number}"
             ]
-
-            found_this_fig = False
-
-            # --- 遍歷 PDF ---
+            
+            # 遍歷 PDF 每一頁
             for i, page in enumerate(doc):
                 raw_text = page.get_text("text")
-                
-                # [過濾] 字數過多跳過
-                if len(raw_text) > 1000: continue
-
-                # [過濾] 黑名單跳過
                 upper_text = raw_text.upper()
-                if any(k in upper_text for k in skip_keywords): continue
-
-                # === 策略 1: 標準搜尋 (優先) ===
-                # 這能解決 US2024... 的問題 (因為 FIG. 2 和 00000 有分隔)
-                if pattern_standard.search(raw_text):
-                    found_page_indices.add(i)
-                    found_this_fig = True
-                    break # 找到這張圖就換下一個圖號
                 
-                # === 策略 2: 強力搜尋 (備用) ===
-                # 解決 TWI... 的 F I G . 2 問題
-                if not found_this_fig:
-                    compressed_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', raw_text).upper()
-                    for token in token_super:
-                        if token in compressed_text:
-                            # 這裡不做 isdigit 檢查，以免像上次一樣誤判 "00000"
-                            found_page_indices.add(i)
-                            found_this_fig = True
-                            break
-                    if found_this_fig:
-                        break
+                # --- 修正：不再使用 len(raw_text) > 1000 過濾 ---
+                # 因為複雜的電路圖或結構圖，元件編號(10, 12, 14...)加起來可能很多字
+                # 我們改用「標題黑名單」來過濾
 
+                # [黑名單過濾] 檢查是否為說明書文字頁
+                is_text_page = False
+                for header in text_section_headers:
+                    if header in upper_text:
+                        is_text_page = True
+                        break
+                if is_text_page: 
+                    continue
+
+                # [比對]
+                found_current = False
+                
+                # 策略 1: 精確比對
+                if pattern_strict.search(raw_text):
+                    found_current = True
+                
+                # 策略 2: 暴力比對 (如果策略1沒找到)
+                if not found_current:
+                    compressed_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', raw_text).upper()
+                    for token in token_loose:
+                        if token in compressed_text:
+                            found_current = True
+                            break
+                
+                if found_current:
+                    found_page_indices.add(i)
+                    log_found.append(target_number)
+                    break # 找到這個圖號的一頁即可 (通常圖號只出現在一頁)
+        
         if not found_page_indices:
             return [], f"找不到圖號: {', '.join(target_numbers)}"
 
@@ -173,6 +187,7 @@ def extract_images_from_pdf(pdf_stream, target_fig_text):
 # --- 函數：提取專利號 ---
 def extract_patent_number_from_text(text):
     clean_text = text.replace("：", ":").replace(" ", "")
+    # 支援斜線格式
     match = re.search(r'([a-zA-Z]{2,4}\d{4}[/]?\d+[a-zA-Z0-9]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
     if match: return match.group(1)
     return ""
@@ -220,7 +235,7 @@ def extract_company_for_sort(text):
     if comp != "(未找到)": return comp
     return "ZZZ"
 
-# --- 函數：正規化字串 ---
+# --- 函數：正規化字串 (用於檔名比對) ---
 def normalize_string(s):
     if not s: return ""
     return re.sub(r'[^A-Z0-9]', '', s.upper())
