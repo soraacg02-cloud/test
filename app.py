@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (精準欄位版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (精準欄位版)")
-st.caption("修正：精準提取公司名稱、案號格式保留斜線、PPT排版優化。")
+st.set_page_config(page_title="PPT 重組生成器 (精準欄位修正版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (精準欄位修正版)")
+st.caption("修正：解決公司欄位空值問題、案號保留斜線、優化排版。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -122,74 +122,70 @@ def extract_specific_figure_from_pdf(pdf_stream, target_fig_text):
 
 # --- 函數：提取專利號 (用於比對與排序) ---
 def extract_patent_number_from_text(text):
-    # 移除標籤，保留原始格式以便 regex 抓取
-    clean_text = text.replace("：", ":")
-    # 抓取常見專利號格式 (含斜線)
-    match = re.search(r'([a-zA-Z]{2}\s?\d{4}[/]\d+[A-Z0-9\s]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
-    if match:
-        # 回傳時移除空白，但保留斜線
-        return match.group(1).replace(" ", "") 
+    clean_text = text.replace("：", ":").replace(" ", "")
+    match = re.search(r'([a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
+    if match: return match.group(1)
     return ""
 
-# --- 函數：提取公司/申請人 (修正版) ---
-def extract_company_for_sort(text):
-    """
-    從文字中提取公司名稱，並過濾掉標題行中的公司標籤。
-    """
-    lines = text.split('\n')
-    found_companies = []
-    
-    for line in lines:
-        if "公司" in line or "申請人" in line:
-            # 如果這行同時有 "案號" 或 "公開號"，通常是標題行，跳過
-            if "案號" in line or "公開號" in line:
-                continue
-            
-            # 提取內容
-            val = line.replace("公司", "").replace("申請人", "").replace("：", "").replace(":", "").strip()
-            if len(val) > 1:
-                found_companies.append(val)
-    
-    if found_companies:
-        return found_companies[0] # 回傳第一個找到的有效公司名
-    return "ZZZ"
-
-# --- 函數：提取 Header 資訊 (診斷報告與PPT用) ---
+# --- 函數：提取詳細 Header 資訊 (診斷報告與PPT用) ---
 def extract_header_info_detail(raw_text):
     """
     回傳 (clean_number, clean_date, clean_company)
+    精準提取：即使資料和標題在同一行也能抓到。
     """
     number = "(未找到)"
     date = "(未找到)"
     company = "(未找到)"
     
-    # 1. 提取案號 (公開號)
-    # 找 "公開號:" 後面的字串
-    match_no = re.search(r'公開號[:：\s]*([^\n]+)', raw_text)
+    # 1. 提取案號 (公開號) - 保留斜線
+    match_no = re.search(r'(?:公開號|案號)[:：\s]*([^\n]+)', raw_text)
     if match_no:
         raw_no = match_no.group(1)
-        # 截斷後面的 "日期" 或 "公司"
-        if "日期" in raw_no: raw_no = raw_no.split("日期")[0]
-        if "公司" in raw_no: raw_no = raw_no.split("公司")[0]
-        
-        # 格式清洗: 移除空白、逗號，保留斜線
+        # 截斷後續欄位
+        raw_no = re.split(r'\s+(?:日期|公司|申請人)[:：]', raw_no)[0]
+        # 修正：只移除空白和逗號，保留斜線 /
         number = raw_no.strip().replace(" ", "").replace(",", "")
 
     # 2. 提取日期
-    match_date = re.search(r'(\d{4}[./-]\d{1,2}[./-]\d{1,2})', raw_text)
+    match_date = re.search(r'(?:日期)[:：\s]*(\d{4}[./-]\d{1,2}[./-]\d{1,2})', raw_text)
     if match_date:
         date = match_date.group(1).strip()
+    else:
+        # 備用：直接找日期格式
+        match_date_backup = re.search(r'(\d{4}[./-]\d{1,2}[./-]\d{1,2})', raw_text)
+        if match_date_backup:
+            date = match_date_backup.group(1).strip()
 
-    # 3. 提取公司 (邏輯同排序函數)
-    lines = raw_text.split('\n')
-    for line in lines:
-        if ("公司" in line or "申請人" in line) and not ("案號" in line or "公開號" in line):
-            val = line.replace("公司", "").replace("申請人", "").replace("：", "").replace(":", "").strip()
-            if len(val) > 1:
-                company = val
+    # 3. 提取公司 (修正：允許多個關鍵字，取最後一個有效的)
+    # 使用 Regex 抓取 "公司:" 或 "申請人:" 後面的內容，直到遇到下一個標籤或行尾
+    # 這裡使用 findall 找出所有可能的公司欄位
+    matches = re.findall(r'(?:公司|申請人)[:：\s]*(.*?)(?=\s+(?:公開號|案號|日期)[:：]|$)', raw_text)
+    
+    if matches:
+        # 取最後一個匹配到的，通常是真實資料 (前面的可能是標題 "1. .../公司")
+        # 並且過濾掉空字串或只包含標點的
+        for candidate in reversed(matches):
+            clean_cand = candidate.strip()
+            # 簡單驗證：長度大於1且不包含 "公開號" 等關鍵字 (避免誤抓)
+            if len(clean_cand) > 1 and "公開號" not in clean_cand:
+                company = clean_cand
                 break
-                
+
     return number, date, company
+
+# --- 函數：提取日期 (排序用) ---
+def extract_date_for_sort(text):
+    match = re.search(r'(\d{4})[./-](\d{1,2})[./-](\d{1,2})', text)
+    if match: return f"{match.group(1)}{match.group(2).zfill(2)}{match.group(3).zfill(2)}"
+    return "99999999"
+
+# --- 函數：提取公司 (排序用 - 修正版) ---
+def extract_company_for_sort(text):
+    # 使用與 extract_header_info_detail 相同的邏輯
+    _, _, comp = extract_header_info_detail(text)
+    if comp != "(未找到)":
+        return comp
+    return "ZZZ"
 
 # --- 函數：解析 Word 檔案 ---
 def parse_word_file(uploaded_docx):
@@ -199,7 +195,7 @@ def parse_word_file(uploaded_docx):
         current_case = {
             "case_info": "", "problem": "", "spirit": "", "key_point": "", "rep_fig_text": "", "claim_text": "",
             "image_data": None, "image_name": "Word匯入", "raw_case_no": "",
-            "clean_number": "", "clean_date": "", "clean_company": "", # 新增欄位
+            "clean_number": "", "clean_date": "", "clean_company": "", 
             "sort_date": "99999999", "sort_company": "ZZZ",
             "source_file": uploaded_docx.name, "missing_fields": []
         }
@@ -218,7 +214,7 @@ def parse_word_file(uploaded_docx):
         for text in all_lines:
             if "案號" in text or "索號" in text:
                 if current_case["case_info"] and current_field != "case_info_block":
-                    # 結算前先提取詳細資訊
+                    # 結算前提取
                     nb, dt, cp = extract_header_info_detail(current_case["case_info"])
                     current_case["clean_number"] = nb
                     current_case["clean_date"] = dt
@@ -237,15 +233,11 @@ def parse_word_file(uploaded_docx):
                 current_field = "case_info_block"
                 current_case["case_info"] = text
                 
-                # 初步提取排序鍵值
-                raw_no = extract_patent_number_from_text(text)
-                if raw_no: current_case["raw_case_no"] = raw_no
-                
-                dt = extract_header_info_detail(text)[1]
+                # 即時更新排序鍵值 (避免第一行就是完整資料)
+                nb, dt, cp = extract_header_info_detail(text)
                 if dt != "(未找到)": current_case["sort_date"] = dt.replace(".", "").replace("/", "").replace("-", "")
-                
-                cp = extract_company_for_sort(text)
-                if cp != "ZZZ": current_case["sort_company"] = cp
+                if cp != "(未找到)": current_case["sort_company"] = cp
+                if nb != "(未找到)": current_case["raw_case_no"] = nb
                 
                 continue
 
@@ -273,16 +265,11 @@ def parse_word_file(uploaded_docx):
 
             if current_field == "case_info_block":
                 current_case["case_info"] += "\n" + text
-                # 累加後更新排序鍵值
-                dt = extract_header_info_detail(current_case["case_info"])[1]
+                # 累加後持續更新
+                nb, dt, cp = extract_header_info_detail(current_case["case_info"])
                 if dt != "(未找到)": current_case["sort_date"] = dt.replace(".", "").replace("/", "").replace("-", "")
-                
-                cp = extract_company_for_sort(current_case["case_info"])
-                if cp != "ZZZ": current_case["sort_company"] = cp
-                
-                if not current_case["raw_case_no"]:
-                    raw_no = extract_patent_number_from_text(text)
-                    if raw_no: current_case["raw_case_no"] = raw_no
+                if cp != "(未找到)": current_case["sort_company"] = cp
+                if nb != "(未找到)": current_case["raw_case_no"] = nb
 
             elif current_field == "rep_fig":
                 current_case["rep_fig_text"] += "\n" + text
@@ -448,12 +435,11 @@ else:
             # === 第一頁 ===
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             
-            # 左上：改為條列式排版
+            # 左上：使用清洗後的資訊，條列式
             left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
             txBox = slide.shapes.add_textbox(left, top, width, height)
             tf = txBox.text_frame; tf.word_wrap = True
             
-            # 使用清洗後的變數
             p1 = tf.add_paragraph(); p1.text = f"公開號：{data['clean_number']}"; p1.font.size = Pt(20); p1.font.bold = True
             p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
             p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
@@ -492,7 +478,7 @@ else:
                 for claim_lines in claims_groups:
                     slide_c = prs.slides.add_slide(prs.slide_layouts[6])
                     
-                    # 2.1 左上 (同樣改為條列式)
+                    # 2.1 左上 (同步條列式)
                     left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
                     txBox = slide_c.shapes.add_textbox(left, top, width, height)
                     tf = txBox.text_frame; tf.word_wrap = True
