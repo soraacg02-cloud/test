@@ -13,11 +13,13 @@ from docx.table import Table
 import fitz  # PyMuPDF
 import re
 import pandas as pd
+from PIL import Image
+import pytesseract # 新增 OCR 套件
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V5 終極寬鬆版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V5 終極寬鬆版)")
-st.caption("革新：V5 版移除了總字數門檻，並加入「全頁特徵」判斷，專門解決只有圖式、字數極少的 PDF 無法讀取的問題。")
+st.set_page_config(page_title="PPT 重組生成器 (V6 OCR 終極版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V6 OCR 終極版)")
+st.caption("革新：V6 引入 OCR (光學字元辨識) 技術。當 PDF 頁面是純圖片或向量文字時，程式會自動「看」圖找字，徹底解決圖號無法識別的問題。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -78,31 +80,27 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 函數：搜尋 PDF 多張截圖 (V5: 終極寬鬆版) ---
-def extract_images_from_pdf_v5(pdf_stream, target_fig_text, debug=False):
+# --- 核心函數：V6 OCR 增強版 ---
+def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
     
     try:
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
         
-        # 1. 解析 Word 中的目標圖號 (強化 Regex)
-        # 允許 FIG1, FIG.1, FIG 1, Figure 1, Fig. 1A
+        # 1. 解析 Word 中的目標圖號
         matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
-        
-        # 備用：若 regex 失敗，嘗試抓第一行中的數字
         if not matches:
             first_line = target_fig_text.split('\n')[0].strip().upper()
             fallback = re.search(r'([0-9]+[A-Z]*)', first_line)
-            if fallback:
-                matches = [fallback.group(1)]
+            if fallback: matches = [fallback.group(1)]
 
         if not matches:
             return [], "無法識別任何圖號"
 
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # 2. 定義「絕對文字頁」的標題 (碰到這些標題就整頁跳過)
+        # 黑名單標題
         page_blacklist_headers = [
             "BRIEF DESCRIPTION", "DETAILED DESCRIPTION", "具体实施方式", "實施方式", 
             "WHAT IS CLAIMED", "权利要求", "申請專利範圍",
@@ -115,101 +113,112 @@ def extract_images_from_pdf_v5(pdf_stream, target_fig_text, debug=False):
 
         # 3. 遍歷每一個目標圖號
         for target_number in target_numbers:
-            # 建立搜尋 Token
             search_tokens = [
-                f"FIG{target_number}", 
-                f"FIGURE{target_number}",
-                f"图{target_number}", 
-                f"圖{target_number}"
+                f"FIG{target_number}", f"FIGURE{target_number}",
+                f"图{target_number}", f"圖{target_number}"
             ]
             
             found_this_fig = False
 
+            # 為了效能，若 PDF 超過 50 頁，且已經找到圖，後面的頁數可以考慮跳過 OCR
+            # 但這裡為了準確度，我們先掃描每一頁
             for i, page in enumerate(doc):
-                # 取得頁面所有文字 (Raw Text) 與區塊 (Blocks)
-                # V5 策略：同時看 Blocks (行) 和 Page Text (全頁)
+                # 取得文字與 Block
                 blocks = page.get_text("blocks")
                 page_text_all = "".join([b[4] for b in blocks]).upper()
                 clean_page_text_all = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', page_text_all)
 
-                # A. [頁級別過濾] 檢查黑名單標題
+                # A. 判斷是否為內文頁 (黑名單)
                 is_text_page = False
                 for header in page_blacklist_headers:
-                    # 只有當黑名單標題出現，且頁面字數夠多時，才當作文字頁
-                    # (避免圖片頁剛好有 Brief Description 的參照)
                     if header in page_text_all and len(clean_page_text_all) > 500:
                         is_text_page = True
                         break
                 
-                # Debug 紀錄
-                if debug and i < 5 and target_number == target_numbers[0]:
-                    debug_logs.append(f"Page {i+1}: Length={len(clean_page_text_all)}, IsTextPage={is_text_page}")
-                    if len(clean_page_text_all) < 100:
-                         debug_logs.append(f"   -> Raw: {clean_page_text_all}")
+                if is_text_page: continue
 
-                if is_text_page: 
-                    continue
-
-                # B. [策略一：行級別比對] (精準)
+                # === B. [一般模式] 文字層比對 ===
                 match_found_strategy_1 = False
+                # 策略 1: 行級別
                 for b in blocks:
                     block_text = b[4].strip()
                     clean_block_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', block_text).upper()
-                    
                     for token in search_tokens:
-                        if token in clean_block_text:
-                            if len(clean_block_text) < 100: # 寬鬆到 100 字
-                                idx = clean_block_text.find(token)
-                                is_exact_match = True
-                                if idx != -1:
-                                    after_idx = idx + len(token)
-                                    if after_idx < len(clean_block_text):
-                                        if clean_block_text[after_idx].isdigit():
-                                            is_exact_match = False
-                                
-                                if is_exact_match:
-                                    found_page_indices.add(i)
-                                    found_this_fig = True
-                                    match_found_strategy_1 = True
-                                    if debug: debug_logs.append(f"✅ [策略一] Found {token} on Page {i+1}")
-                                    break
+                        if token in clean_block_text and len(clean_block_text) < 100:
+                            # 簡單邊界檢查
+                            idx = clean_block_text.find(token)
+                            is_exact_match = True
+                            if idx != -1:
+                                after_idx = idx + len(token)
+                                if after_idx < len(clean_block_text) and clean_block_text[after_idx].isdigit():
+                                    is_exact_match = False
+                            if is_exact_match:
+                                found_page_indices.add(i)
+                                found_this_fig = True
+                                match_found_strategy_1 = True
+                                if debug: debug_logs.append(f"✅ Found {token} (Text Layer) on P{i+1}")
+                                break
                     if match_found_strategy_1: break
+                
+                if match_found_strategy_1: 
+                    if found_this_fig: break
+                    continue # 已經找到，換下一張圖或下一頁
+
+                # 策略 2: 全頁級別 (Fallback for broken blocks)
+                if len(clean_page_text_all) < 500:
+                    for token in search_tokens:
+                        if token in clean_page_text_all:
+                            # 邊界檢查
+                            idx = clean_page_text_all.find(token)
+                            is_exact_match = True
+                            if idx != -1:
+                                after_idx = idx + len(token)
+                                if after_idx < len(clean_page_text_all) and clean_page_text_all[after_idx].isdigit():
+                                    is_exact_match = False
+                            if is_exact_match:
+                                found_page_indices.add(i)
+                                found_this_fig = True
+                                match_found_strategy_1 = True
+                                if debug: debug_logs.append(f"✅ Found {token} (Full Page Text) on P{i+1}")
+                                break
                 
                 if match_found_strategy_1:
                     if found_this_fig: break
                     continue
 
-                # C. [策略二：全頁級別比對 (Fallback)] (V5 新增)
-                # 如果該頁字數極少 (< 500字)，且包含 "FIGX"，就算不是同一行也算找到
-                # 這解決了 FIG 和 1 被拆成不同 Block，或是圖檔 PDF 字數過少的問題
-                if len(clean_page_text_all) < 500:
-                    for token in search_tokens:
-                        if token in clean_page_text_all:
-                             # 這裡做一個簡單的邊界檢查
-                            idx = clean_page_text_all.find(token)
-                            is_exact_match = True
-                            if idx != -1:
-                                after_idx = idx + len(token)
-                                if after_idx < len(clean_page_text_all):
-                                    if clean_page_text_all[after_idx].isdigit():
-                                        is_exact_match = False
-                            
-                            if is_exact_match:
+                # === C. [OCR 模式] 圖片識別 (V6 新增) ===
+                # 觸發條件：該頁文字極少 (可能根本沒文字層)，且還沒找到圖
+                if len(clean_page_text_all) < 50:
+                    try:
+                        # 將 PDF 頁面轉為圖片 (降低一點 DPI 以加快速度，但太低會影響識別)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                        img_data = pix.tobytes("png")
+                        pil_image = Image.open(BytesIO(img_data))
+                        
+                        # 執行 OCR (英數 + 中文)
+                        # psm 11: Sparse text. Find as much text as possible in no particular order.
+                        ocr_text = pytesseract.image_to_string(pil_image, lang='eng+chi_tra', config='--psm 11')
+                        ocr_text_clean = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', ocr_text).upper()
+                        
+                        if debug and i < 5: debug_logs.append(f"👁️ OCR Scan P{i+1}: {ocr_text_clean[:50]}...")
+
+                        for token in search_tokens:
+                            if token in ocr_text_clean:
                                 found_page_indices.add(i)
                                 found_this_fig = True
-                                if debug: debug_logs.append(f"✅ [策略二] Found {token} on Page {i+1} (Full Page Search)")
+                                if debug: debug_logs.append(f"✅ Found {token} (OCR) on P{i+1}")
                                 break
+                    except Exception as ocr_e:
+                        if debug: debug_logs.append(f"⚠️ OCR Error on P{i+1}: {ocr_e}")
 
                 if found_this_fig: break
         
         if debug and debug_logs:
-            with st.expander(f"🔍 Debug: 圖號 {target_numbers} 搜尋日誌"):
+            with st.expander(f"🔍 Debug 日誌: {target_numbers}"):
                 st.text("\n".join(debug_logs))
 
         if not found_page_indices:
-            # V5 移除: if total_text_len < 100 的檢查
-            # 因為圖式專用 PDF 可能整份文件只有 50 個字
-            return [], f"找不到圖號: {', '.join(target_numbers)} (已嘗試全頁寬鬆搜尋)"
+            return [], f"找不到圖號: {', '.join(target_numbers)} (已嘗試文字層與OCR搜尋)"
 
         output_images = []
         for page_idx in sorted(list(found_page_indices)):
@@ -406,7 +415,7 @@ with st.sidebar:
     
     st.divider()
     st.header("3. 進階除錯")
-    debug_mode = st.checkbox("🐞 開啟偵錯模式 (Debug)", value=False, help="勾選後，會顯示 PDF 每一頁讀取到的文字，協助找出為什麼抓不到圖。")
+    debug_mode = st.checkbox("🐞 開啟偵錯模式 (Debug)", value=False, help="勾選後，會顯示詳細的識別日誌，包含 OCR 的辨識結果。")
 
     if word_files and st.button("🔄 開始智能整合", type="primary"):
         all_cases = []
@@ -420,7 +429,7 @@ with st.sidebar:
 
         match_count = 0
         current_ppt_page = 1 
-        with st.spinner("處理中..."):
+        with st.spinner("處理中... (若啟動 OCR 可能需要較長時間，請耐心等候)"):
             all_cases.sort(key=lambda x: (x["sort_company"].upper(), x["sort_date"]))
             for case in all_cases:
                 case_key = case["raw_case_no"]
@@ -457,8 +466,8 @@ with st.sidebar:
                             break
                 
                 if matched_pdf:
-                    # 使用 V5 函數
-                    img_list, msg = extract_images_from_pdf_v5(matched_pdf, target_fig, debug=debug_mode)
+                    # 使用 V6 OCR 函數
+                    img_list, msg = extract_images_from_pdf_v6(matched_pdf, target_fig, debug=debug_mode)
                     if img_list:
                         case["image_list"] = img_list
                         status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
