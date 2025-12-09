@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V9 文字防火牆版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V9 文字防火牆版)")
-st.caption("更新：V9 加入「全頁文字量防火牆」。若單頁文字過多（如圖式說明頁），即使包含圖號也會被跳過，確保只抓取真正的圖片頁。")
+st.set_page_config(page_title="PPT 重組生成器 (V10 語意過濾版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V10 語意過濾版)")
+st.caption("更新：V10 加入「句子偵測」與「語意過濾」。若圖號所在的行包含「為、係、所示」等描述性詞彙，將被視為說明文而非圖片，徹底解決截取到文字頁的問題。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -80,8 +80,8 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 核心函數：V9 文字防火牆 + OCR ---
-def extract_images_from_pdf_v9(pdf_stream, target_fig_text, debug=False):
+# --- 核心函數：V10 語意過濾 + OCR ---
+def extract_images_from_pdf_v10(pdf_stream, target_fig_text, debug=False):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
     
@@ -99,8 +99,19 @@ def extract_images_from_pdf_v9(pdf_stream, target_fig_text, debug=False):
 
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # V9: 定義文字量防火牆門檻 (超過此字數則認定為說明頁)
-        TEXT_HEAVY_THRESHOLD = 300 
+        # V10: 嚴格文字防火牆 (150字)
+        TEXT_HEAVY_THRESHOLD = 150 
+        
+        # V10: 黑名單標題擴充 (含中文括號)
+        page_blacklist_headers = [
+            "BRIEF DESCRIPTION", "DETAILED DESCRIPTION", "具体实施方式", "實施方式", 
+            "WHAT IS CLAIMED", "权利要求", "申請專利範圍", "圖式簡單說明", "【圖式簡單說明】",
+            "ABSTRACT", "摘要", "BACKGROUND", "背景技術",
+            "符号说明", "符號說明"
+        ]
+
+        # V10: 句子特徵詞 (若包含這些，代表是說明文，不是圖片標題)
+        SENTENCE_STOPWORDS = ["為", "係", "所示", "關於", "參照", "參考", "EXAMPLE", "EMBODIMENT", "SHOWS", "REFER"]
 
         found_page_indices = set()
         debug_logs = [] 
@@ -116,40 +127,61 @@ def extract_images_from_pdf_v9(pdf_stream, target_fig_text, debug=False):
             for i, page in enumerate(doc):
                 blocks = page.get_text("blocks")
                 page_text_all = "".join([b[4] for b in blocks]).upper()
-                # 計算全頁有效字數
                 clean_page_text_all = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', page_text_all)
                 page_text_len = len(clean_page_text_all)
 
-                # Debug: 顯示頁面字數資訊
                 if debug and i < 10 and target_number == target_numbers[0]:
                      debug_logs.append(f"Page {i+1}: Length={page_text_len}")
 
-                # === V9 核心：文字防火牆 ===
-                # 如果這一頁字數太多，直接跳過，避免抓到「圖式說明頁」
+                # 1. 頁面級黑名單檢查
+                is_blacklist_page = False
+                for header in page_blacklist_headers:
+                    if header in page_text_all: # 只要標題出現就跳過，不論字數 (更嚴格)
+                        is_blacklist_page = True
+                        if debug and i < 10: debug_logs.append(f"   -> Skip P{i+1} (Header: {header})")
+                        break
+                if is_blacklist_page: continue
+
+                # 2. 文字量防火牆
                 if page_text_len > TEXT_HEAVY_THRESHOLD:
-                    if debug and i < 10 and target_number == target_numbers[0]:
-                         debug_logs.append(f"   -> Skip P{i+1} (Text heavy, likely description page)")
+                    if debug and i < 10: debug_logs.append(f"   -> Skip P{i+1} (Text heavy > {TEXT_HEAVY_THRESHOLD})")
                     continue
 
                 match_found_strategy_1 = False
-                # 策略 1: 行級別 (且全頁字數在門檻內)
+                
+                # 3. 策略 1: 行級別 + 語意過濾 (V10 核心)
                 for b in blocks:
                     block_text = b[4].strip()
                     clean_block_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', block_text).upper()
+                    
                     for token in search_tokens:
-                        # 行本身的字數也要少
-                        if token in clean_block_text and len(clean_block_text) < 100:
+                        if token in clean_block_text and len(clean_block_text) < 80: # 行長度限制
+                            
+                            # === V10 語意檢查 ===
+                            # 檢查這行字是否包含「句子特徵詞」
+                            is_sentence = False
+                            for stopword in SENTENCE_STOPWORDS:
+                                if stopword in clean_block_text:
+                                    is_sentence = True
+                                    break
+                            
+                            if is_sentence:
+                                if debug: debug_logs.append(f"   ⚠️ Skip Line on P{i+1}: '{clean_block_text}' (Looks like a sentence)")
+                                continue # 跳過這行，找下一個 Block
+                            # ==================
+
                             idx = clean_block_text.find(token)
                             is_exact_match = True
                             if idx != -1:
                                 after_idx = idx + len(token)
                                 if after_idx < len(clean_block_text) and clean_block_text[after_idx].isdigit():
                                     is_exact_match = False
+                            
                             if is_exact_match:
                                 found_page_indices.add(i)
                                 found_this_fig = True
                                 match_found_strategy_1 = True
-                                if debug: debug_logs.append(f"✅ Found {token} (Text Layer, Non-Heavy Page) on P{i+1}")
+                                if debug: debug_logs.append(f"✅ Found {token} (Text Layer) on P{i+1}")
                                 break
                     if match_found_strategy_1: break
                 
@@ -157,11 +189,12 @@ def extract_images_from_pdf_v9(pdf_stream, target_fig_text, debug=False):
                     if found_this_fig: break
                     continue
 
-                # 策略 2: 全頁級別 (Fallback，且全頁字數在門檻內)
-                # 這裡的門檻可以比 TEXT_HEAVY_THRESHOLD 更嚴格一點
+                # 4. 策略 2: 全頁級別 (Fallback)
                 if page_text_len < TEXT_HEAVY_THRESHOLD:
                     for token in search_tokens:
                         if token in clean_page_text_all:
+                            # 全頁搜尋比較危險，所以這裡也可以加語意判斷，但全頁文字已經被打散，難以判斷句子
+                            # 依賴嚴格的 TEXT_HEAVY_THRESHOLD (150) 來保護
                             idx = clean_page_text_all.find(token)
                             is_exact_match = True
                             if idx != -1:
@@ -172,15 +205,14 @@ def extract_images_from_pdf_v9(pdf_stream, target_fig_text, debug=False):
                                 found_page_indices.add(i)
                                 found_this_fig = True
                                 match_found_strategy_1 = True
-                                if debug: debug_logs.append(f"✅ Found {token} (Full Page Text, Non-Heavy) on P{i+1}")
+                                if debug: debug_logs.append(f"✅ Found {token} (Full Page Text) on P{i+1}")
                                 break
                 
                 if match_found_strategy_1:
                     if found_this_fig: break
                     continue
 
-                # 策略 3: OCR 模式 (針對幾乎無文字的頁面)
-                # 只有當頁面字數極少時才啟動，避免對文字頁做 OCR
+                # 5. 策略 3: OCR 模式
                 if page_text_len < 50:
                     try:
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
@@ -208,12 +240,11 @@ def extract_images_from_pdf_v9(pdf_stream, target_fig_text, debug=False):
                 st.text("\n".join(debug_logs))
 
         if not found_page_indices:
-            return [], f"找不到圖號: {', '.join(target_numbers)} (已嘗試文字層與OCR搜尋，並過濾文字過多頁面)"
+            return [], f"找不到圖號: {', '.join(target_numbers)} (已嘗試文字層與OCR搜尋)"
 
         output_images = []
         for page_idx in sorted(list(found_page_indices)):
             page = doc[page_idx]
-            # V9 優化：提高截圖解析度 Matrix(4,4) 讓圖更清晰
             mat = fitz.Matrix(4, 4) 
             pix = page.get_pixmap(matrix=mat)
             output_images.append(pix.tobytes("png"))
@@ -403,7 +434,6 @@ with st.sidebar:
     debug_mode = st.checkbox("🐞 開啟偵錯模式 (Debug)", value=False, help="勾選後，會顯示詳細的識別日誌，包含 OCR 的辨識結果。")
 
     st.divider()
-    # === 按鈕維持解鎖狀態 ===
     run_btn = st.button("🔄 開始智能整合", type="primary")
 
     if run_btn:
@@ -459,8 +489,7 @@ with st.sidebar:
                             break
                 
                 if matched_pdf:
-                    # 使用 V9 函數
-                    img_list, msg = extract_images_from_pdf_v9(matched_pdf, target_fig, debug=debug_mode)
+                    img_list, msg = extract_images_from_pdf_v10(matched_pdf, target_fig, debug=debug_mode)
                     if img_list:
                         case["image_list"] = img_list
                         status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
