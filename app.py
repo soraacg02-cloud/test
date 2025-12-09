@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V14 Claim 配圖版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V14 Claim 配圖版)")
-st.caption("更新：V14 新增 Claim 分頁智慧配圖功能。自動偵測 Claim 文字中的圖號並抓取對應圖片；若無指定，則自動帶入代表圖。")
+st.set_page_config(page_title="PPT 重組生成器 (V15 Claim 報告增強版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V15 Claim 報告增強版)")
+st.caption("更新：V15 在診斷報告中新增「Claim 圖狀態」欄位，並修正 Claim 分頁貼圖邏輯，確保圖片能正確顯示。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -82,13 +82,12 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 核心函數：V13 動態平衡版邏輯 (保留不變) ---
+# --- 核心函數：V13 動態平衡版邏輯 ---
 def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=False, log_prefix=""):
     if not target_fig_text:
         return [], f"{log_prefix}未指定圖號"
     
     try:
-        # 重設指標，確保可以重複讀取
         if hasattr(pdf_stream, 'seek'):
             pdf_stream.seek(0)
             
@@ -105,7 +104,7 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
 
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # === V13 參數 ===
+        # V13 參數
         PAGE_TEXT_THRESHOLD_OCR = 800  
         PAGE_TEXT_THRESHOLD_RAW = 600 
         LONG_SENTENCE_LIMIT = 80 
@@ -134,13 +133,11 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
             found_this_fig = False
 
             for i, page in enumerate(doc):
-                # --- A. 原始文字層 ---
                 blocks = page.get_text("blocks")
                 page_text_all = "".join([b[4] for b in blocks]).upper()
                 clean_page_text_all = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', page_text_all)
                 page_text_len = len(clean_page_text_all)
 
-                # 1. 黑名單
                 is_blacklist_page = False
                 for header in page_blacklist_headers:
                     if header in page_text_all:
@@ -149,7 +146,6 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                         break
                 if is_blacklist_page: continue
 
-                # 2. 長段落檢測
                 long_sentence_count = 0
                 for b in blocks:
                     if len(re.sub(r'\s+', '', b[4])) > LONG_SENTENCE_LIMIT:
@@ -159,12 +155,10 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                     if debug and i < 15: debug_logs.append(f"{log_prefix}🚫 Skip P{i+1} (Raw: Long sentences)")
                     continue
 
-                # 3. 字數防火牆 (Raw)
                 if page_text_len > PAGE_TEXT_THRESHOLD_RAW:
                     if debug and i < 15: debug_logs.append(f"{log_prefix}🚫 Skip P{i+1} (Raw Heavy: {page_text_len})")
                     continue
 
-                # --- 策略 1: 原始文字層搜尋 ---
                 match_found_strategy_1 = False
                 for b in blocks:
                     block_text = b[4].strip()
@@ -200,7 +194,6 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                     if found_this_fig: break
                     continue
 
-                # --- 策略 2: Fallback (Raw) ---
                 if page_text_len < PAGE_TEXT_THRESHOLD_RAW:
                     for token in search_tokens:
                         if token in clean_page_text_all:
@@ -221,7 +214,6 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                     if found_this_fig: break
                     continue
 
-                # --- 策略 3: OCR 模式 ---
                 if page_text_len < 200: 
                     try:
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
@@ -274,7 +266,6 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
 
                 if found_this_fig: break
         
-        # 儲存 Log (Append 模式)
         if debug:
             if case_key not in st.session_state['debug_logs_map']:
                 st.session_state['debug_logs_map'][case_key] = ""
@@ -464,7 +455,6 @@ def split_claims_text(full_text):
 def parse_fig_number_from_claim(claim_text):
     """從 Claim 文字中偵測是否有指定特定圖號"""
     if not claim_text: return None
-    # 找尋 (FIG. X) 或 (圖 X) 或 圖X 所示
     matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', claim_text, re.IGNORECASE)
     if matches:
         return "FIG. " + ", FIG. ".join(sorted(list(set(matches))))
@@ -534,7 +524,8 @@ with st.sidebar:
                     "公司": case["clean_company"],
                     "日期(優先權日)": case["clean_date"],
                     "對應PPT的頁碼": page_str,
-                    "狀態": "未處理", "原因": "", "缺漏": ", ".join(case["missing_fields"])
+                    "狀態": "未處理", "原因": "", "缺漏": ", ".join(case["missing_fields"]),
+                    "Claim圖狀態": "N/A", "Claim圖說明": ""
                 }
                 
                 matched_pdf = None
@@ -548,34 +539,46 @@ with st.sidebar:
                             break
                 
                 if matched_pdf:
-                    # 1. 抓取主要代表圖 (Main Slide)
+                    # 1. 抓取主要代表圖
                     img_list_main, msg_main = extract_images_from_pdf_v13(matched_pdf, target_fig, case_key, debug=debug_mode, log_prefix="[Main] ")
                     
-                    # 2. 抓取 Claim 附圖 (V14 Feature)
-                    # 檢查 Claim 文字中有無指定圖號
-                    specific_claim_fig = parse_fig_number_from_claim(claim_text_content)
-                    
-                    img_list_claim = []
-                    msg_claim = ""
-                    
-                    if specific_claim_fig:
-                        # 如果有指定，去 PDF 抓那張圖
-                        img_list_claim, msg_claim = extract_images_from_pdf_v13(matched_pdf, specific_claim_fig, case_key, debug=debug_mode, log_prefix="[Claim] ")
-                        if not img_list_claim: # 抓不到就回退用主圖
-                             img_list_claim = img_list_main
-                             msg_claim = "Claim圖抓取失敗，使用主圖"
-                    else:
-                        # 沒指定就用主圖
-                        img_list_claim = img_list_main
-                        msg_claim = "Claim未指定圖，使用主圖"
-
                     if img_list_main:
                         case["image_list"] = img_list_main
-                        case["claim_image_list"] = img_list_claim # 存入 Claim 圖片
                         status["狀態"] = f"✅ 成功 ({len(img_list_main)}張)"
                         match_count += 1
                     else:
                         status["狀態"] = "⚠️ 缺圖"; status["原因"] = msg_main
+
+                    # 2. 抓取 Claim 附圖
+                    if add_claim_slide:
+                        specific_claim_fig = parse_fig_number_from_claim(claim_text_content)
+                        img_list_claim = []
+                        msg_claim = ""
+                        
+                        if specific_claim_fig:
+                            img_list_claim, msg_claim = extract_images_from_pdf_v13(matched_pdf, specific_claim_fig, case_key, debug=debug_mode, log_prefix="[Claim] ")
+                            if img_list_claim:
+                                status["Claim圖狀態"] = f"✅ 專屬 ({len(img_list_claim)}張)"
+                                status["Claim圖說明"] = f"找到指定圖: {specific_claim_fig}"
+                            else:
+                                if img_list_main:
+                                    img_list_claim = img_list_main
+                                    status["Claim圖狀態"] = "⚠️ 沿用主圖"
+                                    status["Claim圖說明"] = f"指定圖 ({specific_claim_fig}) 抓取失敗: {msg_claim}"
+                                else:
+                                    status["Claim圖狀態"] = "❌ 缺圖"
+                                    status["Claim圖說明"] = "指定失敗且無主圖"
+                        else:
+                            if img_list_main:
+                                img_list_claim = img_list_main
+                                status["Claim圖狀態"] = "✅ 同主圖"
+                                status["Claim圖說明"] = "Claim未指定特定圖號"
+                            else:
+                                status["Claim圖狀態"] = "❌ 缺圖"
+                                status["Claim圖說明"] = "無主圖可沿用"
+                        
+                        case["claim_image_list"] = img_list_claim
+
                 else:
                     if not target_fig: status["狀態"] = "⚠️ 缺資訊"; status["原因"] = "Word無代表圖"
                     else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key}"
@@ -611,7 +614,6 @@ else:
                 if data['image_list']:
                     st.image(data['image_list'][0], caption=f"主圖 ({len(data['image_list'])})", use_column_width=True)
                 
-                # V14: 顯示 Claim 圖片預覽
                 if data.get('claim_image_list'):
                      st.image(data['claim_image_list'][0], caption=f"Claim 用圖 ({len(data['claim_image_list'])})", use_column_width=True)
                 
@@ -675,7 +677,7 @@ else:
             p = shape.text_frame.paragraphs[0]; p.text = data['key_point']; p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(20); p.font.bold = True
             shape.text_frame.vertical_anchor = MSO_SHAPE.RECTANGLE
 
-            # === Claim Slides (V14 Updated) ===
+            # === Claim Slides ===
             if need_claim_slide:
                 claims_groups = split_claims_text(data['claim_text'])
                 if not claims_groups and data['claim_text'].strip():
@@ -691,10 +693,10 @@ else:
                     p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
                     p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
                     
-                    # V14: 插入 Claim 圖片 (與 Main Slide 右上角相同位置)
+                    # 貼上 Claim 圖片 (如果有)
                     claim_imgs = data.get('claim_image_list', [])
                     if claim_imgs:
-                        img_left = Inches(5.5); img_top = Inches(0.5); 
+                        img_left = Inches(5.5); img_top = Inches(0.5)
                         num_imgs = len(claim_imgs)
                         img_w = (7.0 / num_imgs) - 0.1
                         img_h = 3.0
@@ -702,11 +704,12 @@ else:
                             this_left = 5.5 + (idx * (img_w + 0.1))
                             slide_c.shapes.add_picture(BytesIO(img_bytes), Inches(this_left), Inches(0.5), height=Inches(img_h))
 
-                    left, top, width, height = Inches(0.5), Inches(2.5), Inches(12.3), Inches(4.5)
-                    # 如果有圖，文字框稍微往下移一點，避免蓋到圖
+                    # 根據有無圖片調整文字框位置
+                    left, width = Inches(0.5), Inches(12.3)
                     if claim_imgs:
-                         top = Inches(3.6)
-                         height = Inches(3.4)
+                         top = Inches(3.6); height = Inches(3.4)
+                    else:
+                         top = Inches(2.5); height = Inches(4.5)
 
                     txBox = slide_c.shapes.add_textbox(left, top, width, height)
                     tf = txBox.text_frame; tf.word_wrap = True
@@ -751,5 +754,5 @@ else:
     st.subheader("📊 診斷報告")
     if st.session_state['status_report']:
         df = pd.DataFrame(st.session_state['status_report'])
-        cols = ["來源", "案號(公開號)", "公司", "日期(優先權日)", "對應PPT的頁碼", "狀態", "原因", "缺漏"]
+        cols = ["來源", "案號(公開號)", "公司", "日期(優先權日)", "對應PPT的頁碼", "狀態", "原因", "Claim圖狀態", "Claim圖說明", "缺漏"]
         st.dataframe(df[cols], hide_index=True)
