@@ -266,6 +266,7 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
 
                 if found_this_fig: break
         
+        # 儲存 Log (Append 模式)
         if debug:
             if case_key not in st.session_state['debug_logs_map']:
                 st.session_state['debug_logs_map'][case_key] = ""
@@ -572,10 +573,10 @@ with st.sidebar:
                             if img_list_main:
                                 img_list_claim = img_list_main
                                 status["Claim圖狀態"] = "✅ 同主圖"
-                                status["Claim圖說明"] = "Claim未指定特定圖號"
+                                status["Claim圖說明"] = "未指定"
                             else:
                                 status["Claim圖狀態"] = "❌ 缺圖"
-                                status["Claim圖說明"] = "無主圖可沿用"
+                                status["Claim圖說明"] = "未指定且無主圖"
                         
                         case["claim_image_list"] = img_list_claim
 
