@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V4 偵錯版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V4 偵錯版)")
-st.caption("革新：V4 核心邏輯 (放寬行字數限制 + 偵錯模式)，解決圖號被誤判為內文的問題。")
+st.set_page_config(page_title="PPT 重組生成器 (V5 終極寬鬆版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V5 終極寬鬆版)")
+st.caption("革新：V5 版移除了總字數門檻，並加入「全頁特徵」判斷，專門解決只有圖式、字數極少的 PDF 無法讀取的問題。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -78,17 +78,19 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 函數：搜尋 PDF 多張截圖 (V4: 寬鬆與偵錯版) ---
-def extract_images_from_pdf_v4(pdf_stream, target_fig_text, debug=False):
+# --- 函數：搜尋 PDF 多張截圖 (V5: 終極寬鬆版) ---
+def extract_images_from_pdf_v5(pdf_stream, target_fig_text, debug=False):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
     
     try:
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
         
-        # 1. 解析 Word 中的目標圖號
+        # 1. 解析 Word 中的目標圖號 (強化 Regex)
+        # 允許 FIG1, FIG.1, FIG 1, Figure 1, Fig. 1A
         matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
-        # 備用：若 regex 失敗，嘗試抓第一行
+        
+        # 備用：若 regex 失敗，嘗試抓第一行中的數字
         if not matches:
             first_line = target_fig_text.split('\n')[0].strip().upper()
             fallback = re.search(r'([0-9]+[A-Z]*)', first_line)
@@ -109,7 +111,7 @@ def extract_images_from_pdf_v4(pdf_stream, target_fig_text, debug=False):
         ]
 
         found_page_indices = set()
-        debug_logs = [] # Debug 容器
+        debug_logs = [] 
 
         # 3. 遍歷每一個目標圖號
         for target_number in target_numbers:
@@ -124,38 +126,39 @@ def extract_images_from_pdf_v4(pdf_stream, target_fig_text, debug=False):
             found_this_fig = False
 
             for i, page in enumerate(doc):
-                # 取得頁面文字區塊
+                # 取得頁面所有文字 (Raw Text) 與區塊 (Blocks)
+                # V5 策略：同時看 Blocks (行) 和 Page Text (全頁)
                 blocks = page.get_text("blocks")
                 page_text_all = "".join([b[4] for b in blocks]).upper()
+                clean_page_text_all = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', page_text_all)
 
                 # A. [頁級別過濾] 檢查黑名單標題
                 is_text_page = False
                 for header in page_blacklist_headers:
-                    if header in page_text_all:
+                    # 只有當黑名單標題出現，且頁面字數夠多時，才當作文字頁
+                    # (避免圖片頁剛好有 Brief Description 的參照)
+                    if header in page_text_all and len(clean_page_text_all) > 500:
                         is_text_page = True
                         break
                 
-                # Debug: 顯示前幾頁的讀取狀況 (只在找第一個圖號時顯示，避免洗版)
+                # Debug 紀錄
                 if debug and i < 5 and target_number == target_numbers[0]:
-                    debug_logs.append(f"Page {i+1}: Text Length={len(page_text_all)}, IsTextPage={is_text_page}")
-                    if len(page_text_all) < 200: 
-                         debug_logs.append(f"   -> Content: {page_text_all[:100]}...")
+                    debug_logs.append(f"Page {i+1}: Length={len(clean_page_text_all)}, IsTextPage={is_text_page}")
+                    if len(clean_page_text_all) < 100:
+                         debug_logs.append(f"   -> Raw: {clean_page_text_all}")
 
                 if is_text_page: 
                     continue
 
-                # B. [行級別比對]
+                # B. [策略一：行級別比對] (精準)
+                match_found_strategy_1 = False
                 for b in blocks:
                     block_text = b[4].strip()
-                    # 正規化：去除非英數字與中文，轉大寫
                     clean_block_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', block_text).upper()
                     
                     for token in search_tokens:
                         if token in clean_block_text:
-                            # 核心邏輯修正：放寬長度限制到 80 (原本30)
-                            # 這是為了允許 "FIG. 1 Schematic View" 這種情況
-                            if len(clean_block_text) < 80:
-                                # 邊界檢查 (避免 FIG1 抓到 FIG10)
+                            if len(clean_block_text) < 100: # 寬鬆到 100 字
                                 idx = clean_block_text.find(token)
                                 is_exact_match = True
                                 if idx != -1:
@@ -167,27 +170,51 @@ def extract_images_from_pdf_v4(pdf_stream, target_fig_text, debug=False):
                                 if is_exact_match:
                                     found_page_indices.add(i)
                                     found_this_fig = True
-                                    if debug: debug_logs.append(f"✅ Found {token} on Page {i+1} (Text: {clean_block_text})")
+                                    match_found_strategy_1 = True
+                                    if debug: debug_logs.append(f"✅ [策略一] Found {token} on Page {i+1}")
                                     break
+                    if match_found_strategy_1: break
+                
+                if match_found_strategy_1:
                     if found_this_fig: break
+                    continue
+
+                # C. [策略二：全頁級別比對 (Fallback)] (V5 新增)
+                # 如果該頁字數極少 (< 500字)，且包含 "FIGX"，就算不是同一行也算找到
+                # 這解決了 FIG 和 1 被拆成不同 Block，或是圖檔 PDF 字數過少的問題
+                if len(clean_page_text_all) < 500:
+                    for token in search_tokens:
+                        if token in clean_page_text_all:
+                             # 這裡做一個簡單的邊界檢查
+                            idx = clean_page_text_all.find(token)
+                            is_exact_match = True
+                            if idx != -1:
+                                after_idx = idx + len(token)
+                                if after_idx < len(clean_page_text_all):
+                                    if clean_page_text_all[after_idx].isdigit():
+                                        is_exact_match = False
+                            
+                            if is_exact_match:
+                                found_page_indices.add(i)
+                                found_this_fig = True
+                                if debug: debug_logs.append(f"✅ [策略二] Found {token} on Page {i+1} (Full Page Search)")
+                                break
+
                 if found_this_fig: break
         
-        # 顯示 Debug 資訊
         if debug and debug_logs:
             with st.expander(f"🔍 Debug: 圖號 {target_numbers} 搜尋日誌"):
                 st.text("\n".join(debug_logs))
 
         if not found_page_indices:
-            # 若找不到，檢查是否整份 PDF 根本讀不到字 (掃描檔問題)
-            total_text_len = sum([len(page.get_text()) for page in doc])
-            if total_text_len < 100:
-                return [], "PDF 似乎沒有文字層 (可能是純圖片掃描檔)"
-            return [], f"找不到圖號: {', '.join(target_numbers)} (請嘗試開啟 Debug 模式檢查)"
+            # V5 移除: if total_text_len < 100 的檢查
+            # 因為圖式專用 PDF 可能整份文件只有 50 個字
+            return [], f"找不到圖號: {', '.join(target_numbers)} (已嘗試全頁寬鬆搜尋)"
 
         output_images = []
         for page_idx in sorted(list(found_page_indices)):
             page = doc[page_idx]
-            mat = fitz.Matrix(3, 3) # 提高解析度
+            mat = fitz.Matrix(3, 3) 
             pix = page.get_pixmap(matrix=mat)
             output_images.append(pix.tobytes("png"))
 
@@ -430,8 +457,8 @@ with st.sidebar:
                             break
                 
                 if matched_pdf:
-                    # 使用 V4 函數 (含 Debug)
-                    img_list, msg = extract_images_from_pdf_v4(matched_pdf, target_fig, debug=debug_mode)
+                    # 使用 V5 函數
+                    img_list, msg = extract_images_from_pdf_v5(matched_pdf, target_fig, debug=debug_mode)
                     if img_list:
                         case["image_list"] = img_list
                         status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
