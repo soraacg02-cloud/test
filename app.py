@@ -14,12 +14,12 @@ import fitz  # PyMuPDF
 import re
 import pandas as pd
 from PIL import Image
-import pytesseract # 新增 OCR 套件
+import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V6 OCR 終極版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V6 OCR 終極版)")
-st.caption("革新：V6 引入 OCR (光學字元辨識) 技術。當 PDF 頁面是純圖片或向量文字時，程式會自動「看」圖找字，徹底解決圖號無法識別的問題。")
+st.set_page_config(page_title="PPT 重組生成器 (V7 穩定按鈕版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V7 穩定按鈕版)")
+st.caption("革新：V7 修正按鈕消失問題，並保留 OCR 識別功能。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -80,7 +80,7 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 核心函數：V6 OCR 增強版 ---
+# --- 核心函數：V6/V7 OCR 增強版 ---
 def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
@@ -88,7 +88,6 @@ def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
     try:
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
         
-        # 1. 解析 Word 中的目標圖號
         matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
         if not matches:
             first_line = target_fig_text.split('\n')[0].strip().upper()
@@ -100,7 +99,6 @@ def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
 
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # 黑名單標題
         page_blacklist_headers = [
             "BRIEF DESCRIPTION", "DETAILED DESCRIPTION", "具体实施方式", "實施方式", 
             "WHAT IS CLAIMED", "权利要求", "申請專利範圍",
@@ -111,7 +109,6 @@ def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
         found_page_indices = set()
         debug_logs = [] 
 
-        # 3. 遍歷每一個目標圖號
         for target_number in target_numbers:
             search_tokens = [
                 f"FIG{target_number}", f"FIGURE{target_number}",
@@ -120,15 +117,11 @@ def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
             
             found_this_fig = False
 
-            # 為了效能，若 PDF 超過 50 頁，且已經找到圖，後面的頁數可以考慮跳過 OCR
-            # 但這裡為了準確度，我們先掃描每一頁
             for i, page in enumerate(doc):
-                # 取得文字與 Block
                 blocks = page.get_text("blocks")
                 page_text_all = "".join([b[4] for b in blocks]).upper()
                 clean_page_text_all = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', page_text_all)
 
-                # A. 判斷是否為內文頁 (黑名單)
                 is_text_page = False
                 for header in page_blacklist_headers:
                     if header in page_text_all and len(clean_page_text_all) > 500:
@@ -137,7 +130,6 @@ def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
                 
                 if is_text_page: continue
 
-                # === B. [一般模式] 文字層比對 ===
                 match_found_strategy_1 = False
                 # 策略 1: 行級別
                 for b in blocks:
@@ -145,7 +137,6 @@ def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
                     clean_block_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', block_text).upper()
                     for token in search_tokens:
                         if token in clean_block_text and len(clean_block_text) < 100:
-                            # 簡單邊界檢查
                             idx = clean_block_text.find(token)
                             is_exact_match = True
                             if idx != -1:
@@ -162,13 +153,12 @@ def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
                 
                 if match_found_strategy_1: 
                     if found_this_fig: break
-                    continue # 已經找到，換下一張圖或下一頁
+                    continue
 
-                # 策略 2: 全頁級別 (Fallback for broken blocks)
+                # 策略 2: 全頁級別 (Fallback)
                 if len(clean_page_text_all) < 500:
                     for token in search_tokens:
                         if token in clean_page_text_all:
-                            # 邊界檢查
                             idx = clean_page_text_all.find(token)
                             is_exact_match = True
                             if idx != -1:
@@ -186,17 +176,13 @@ def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
                     if found_this_fig: break
                     continue
 
-                # === C. [OCR 模式] 圖片識別 (V6 新增) ===
-                # 觸發條件：該頁文字極少 (可能根本沒文字層)，且還沒找到圖
+                # 策略 3: OCR 模式
                 if len(clean_page_text_all) < 50:
                     try:
-                        # 將 PDF 頁面轉為圖片 (降低一點 DPI 以加快速度，但太低會影響識別)
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                         img_data = pix.tobytes("png")
                         pil_image = Image.open(BytesIO(img_data))
                         
-                        # 執行 OCR (英數 + 中文)
-                        # psm 11: Sparse text. Find as much text as possible in no particular order.
                         ocr_text = pytesseract.image_to_string(pil_image, lang='eng+chi_tra', config='--psm 11')
                         ocr_text_clean = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', ocr_text).upper()
                         
@@ -232,14 +218,13 @@ def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
     except Exception as e:
         return [], f"PDF 解析錯誤: {str(e)}"
 
-# --- 函數：提取專利號 ---
+# --- 函數：提取專利號 等 ---
 def extract_patent_number_from_text(text):
     clean_text = text.replace("：", ":").replace(" ", "")
     match = re.search(r'([a-zA-Z]{2,4}\d{4}[/]?\d+[a-zA-Z0-9]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
     if match: return match.group(1)
     return ""
 
-# --- 函數：提取詳細 Header 資訊 ---
 def extract_header_info_detail(raw_text):
     number = "(未找到)"
     date = "(未找到)"
@@ -270,24 +255,20 @@ def extract_header_info_detail(raw_text):
 
     return number, date, company
 
-# --- 函數：提取日期 (排序用) ---
 def extract_date_for_sort(text):
     match = re.search(r'(\d{4})[./-](\d{1,2})[./-](\d{1,2})', text)
     if match: return f"{match.group(1)}{match.group(2).zfill(2)}{match.group(3).zfill(2)}"
     return "99999999"
 
-# --- 函數：提取公司 (排序用) ---
 def extract_company_for_sort(text):
     _, _, comp = extract_header_info_detail(text)
     if comp != "(未找到)": return comp
     return "ZZZ"
 
-# --- 函數：正規化字串 ---
 def normalize_string(s):
     if not s: return ""
     return re.sub(r'[^A-Z0-9]', '', s.upper())
 
-# --- 函數：解析 Word 檔案 ---
 def parse_word_file(uploaded_docx):
     try:
         doc = docx.Document(uploaded_docx)
@@ -387,7 +368,6 @@ def parse_word_file(uploaded_docx):
         st.error(f"解析 Word 錯誤 ({uploaded_docx.name}): {e}")
         return []
 
-# --- 輔助函數：分割 Claim ---
 def split_claims_text(full_text):
     if not full_text: return []
     lines = full_text.split('\n')
@@ -404,7 +384,7 @@ def split_claims_text(full_text):
     if current_chunk and "".join(current_chunk).strip(): claims.append(current_chunk)
     return claims
 
-# --- 側邊欄 ---
+# --- 側邊欄 (修正按鈕邏輯) ---
 with st.sidebar:
     st.header("1. 匯入資料")
     word_files = st.file_uploader("Word 檔案 (可多選)", type=['docx'], accept_multiple_files=True)
@@ -417,7 +397,12 @@ with st.sidebar:
     st.header("3. 進階除錯")
     debug_mode = st.checkbox("🐞 開啟偵錯模式 (Debug)", value=False, help="勾選後，會顯示詳細的識別日誌，包含 OCR 的辨識結果。")
 
-    if word_files and st.button("🔄 開始智能整合", type="primary"):
+    st.divider()
+    # === V7 修正重點：強制按鈕顯示，若無檔案則 disable ===
+    btn_disabled = not word_files # 如果沒有 Word 檔案，就禁用按鈕
+    run_btn = st.button("🔄 開始智能整合", type="primary", disabled=btn_disabled)
+
+    if run_btn:
         all_cases = []
         status_report_list = []
         for wf in word_files: all_cases.extend(parse_word_file(wf))
@@ -443,190 +428,3 @@ with st.sidebar:
                 
                 start_page = current_ppt_page
                 end_page = current_ppt_page + pages_this_case - 1
-                page_str = f"P{start_page}" if start_page == end_page else f"P{start_page}-P{end_page}"
-                current_ppt_page += pages_this_case
-
-                status = {
-                    "來源": case["source_file"], 
-                    "案號(公開號)": case["clean_number"],
-                    "公司": case["clean_company"],
-                    "日期(優先權日)": case["clean_date"],
-                    "對應PPT的頁碼": page_str,
-                    "狀態": "未處理", "原因": "", "缺漏": ", ".join(case["missing_fields"])
-                }
-                
-                matched_pdf = None
-                norm_case_key = normalize_string(case_key)
-                
-                for pdf_name, pdf_bytes in pdf_file_map.items():
-                    norm_pdf_name = normalize_string(pdf_name)
-                    if norm_case_key and ((norm_case_key in norm_pdf_name) or (norm_pdf_name in norm_case_key)):
-                        if len(norm_case_key) > 5:
-                            matched_pdf = pdf_bytes
-                            break
-                
-                if matched_pdf:
-                    # 使用 V6 OCR 函數
-                    img_list, msg = extract_images_from_pdf_v6(matched_pdf, target_fig, debug=debug_mode)
-                    if img_list:
-                        case["image_list"] = img_list
-                        status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
-                        match_count += 1
-                    else:
-                        status["狀態"] = "⚠️ 缺圖"; status["原因"] = msg
-                else:
-                    if not target_fig: status["狀態"] = "⚠️ 缺資訊"; status["原因"] = "Word無代表圖"
-                    else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key}"
-                status_report_list.append(status)
-
-        if all_cases:
-            st.session_state['slides_data'] = all_cases
-            st.session_state['status_report'] = status_report_list
-            st.success(f"完成！共 {len(all_cases)} 筆資料。")
-        else:
-            st.warning("無資料。")
-
-    if st.session_state['slides_data']:
-        st.divider()
-        if st.button("🗑️ 清除重來"):
-            st.session_state['slides_data'] = []
-            st.session_state['status_report'] = []
-            st.rerun()
-
-# --- 主畫面 ---
-if not st.session_state['slides_data']:
-    st.info("👈 請先上傳檔案。")
-else:
-    st.subheader(f"📋 預覽 (已排序: 申請人 -> 日期)")
-    cols = st.columns(3)
-    for i, data in enumerate(st.session_state['slides_data']):
-        with cols[i % 3]:
-            with st.container(border=True):
-                st.markdown(f"**Case {i+1}**")
-                st.caption(f"{data['clean_company']} | {data['clean_date']}")
-                st.text(f"{data['clean_number']}")
-                if data['image_list']:
-                    st.image(data['image_list'][0], caption=f"共 {len(data['image_list'])} 張圖", use_column_width=True)
-                else:
-                    st.warning("無圖片")
-                full_claim_text = data['claim_text']
-                claims_preview = split_claims_text(full_claim_text)
-                count_claims = len(claims_preview) if full_claim_text else 0
-                st.caption(f"Claim: {count_claims} 組")
-
-    # --- PPT 生成邏輯 ---
-    def generate_ppt(slides_data, need_claim_slide):
-        prs = Presentation()
-        prs.slide_width = Inches(13.333)
-        prs.slide_height = Inches(7.5)
-        for data in slides_data:
-            slide = prs.slides.add_slide(prs.slide_layouts[6])
-            
-            left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
-            txBox = slide.shapes.add_textbox(left, top, width, height)
-            tf = txBox.text_frame; tf.word_wrap = True
-            p1 = tf.add_paragraph(); p1.text = f"公開號：{data['clean_number']}"; p1.font.size = Pt(20); p1.font.bold = True
-            p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
-            p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
-
-            img_left = Inches(5.5); img_top = Inches(0.5); img_width = Inches(7.0)
-            img_list = data.get('image_list', [])
-            
-            if img_list:
-                num_imgs = len(img_list)
-                img_w = (7.0 / num_imgs) - 0.1
-                img_h = 3.0
-                for idx, img_bytes in enumerate(img_list):
-                    this_left = 5.5 + (idx * (img_w + 0.1))
-                    slide.shapes.add_picture(BytesIO(img_bytes), Inches(this_left), Inches(0.5), height=Inches(img_h))
-                
-                text_top = Inches(3.6)
-                text_height = Inches(1.0)
-                txBox = slide.shapes.add_textbox(img_left, text_top, img_width, text_height)
-                tf = txBox.text_frame; tf.word_wrap = True
-                content = data['rep_fig_text'] if data['rep_fig_text'].strip() else ""
-                for line in content.split('\n'):
-                    if line.strip():
-                        p = tf.add_paragraph(); p.text = line.strip(); p.font.size = Pt(14)
-            else:
-                img_height = Inches(4.0)
-                txBox = slide.shapes.add_textbox(img_left, img_top, img_width, img_height)
-                tf = txBox.text_frame; tf.word_wrap = True
-                content = data['rep_fig_text'] if data['rep_fig_text'].strip() else "無代表圖資訊"
-                for line in content.split('\n'):
-                    if line.strip():
-                        p = tf.add_paragraph(); p.text = line.strip(); p.font.size = Pt(16)
-
-            left, top, width, height = Inches(0.5), Inches(4.8), Inches(12.3), Inches(1.5)
-            txBox = slide.shapes.add_textbox(left, top, width, height)
-            tf = txBox.text_frame; tf.word_wrap = True
-            p1 = tf.add_paragraph(); p1.text = "• 解決問題：" + data['problem']; p1.font.size = Pt(18); p1.space_after = Pt(12)
-            p2 = tf.add_paragraph(); p2.text = "• 發明精神：" + data['spirit']; p2.font.size = Pt(18)
-
-            left, top, width, height = Inches(0.5), Inches(6.5), Inches(12.3), Inches(0.8)
-            shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
-            shape.fill.solid(); shape.fill.fore_color.rgb = RGBColor(255, 192, 0); shape.line.color.rgb = RGBColor(255, 192, 0)
-            p = shape.text_frame.paragraphs[0]; p.text = data['key_point']; p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(20); p.font.bold = True
-            shape.text_frame.vertical_anchor = MSO_SHAPE.RECTANGLE
-
-            if need_claim_slide:
-                claims_groups = split_claims_text(data['claim_text'])
-                if not claims_groups and data['claim_text'].strip():
-                      claims_groups = [data['claim_text'].split('\n')]
-
-                for claim_lines in claims_groups:
-                    slide_c = prs.slides.add_slide(prs.slide_layouts[6])
-                    
-                    left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
-                    txBox = slide_c.shapes.add_textbox(left, top, width, height)
-                    tf = txBox.text_frame; tf.word_wrap = True
-                    p1 = tf.add_paragraph(); p1.text = f"公開號：{data['clean_number']}"; p1.font.size = Pt(20); p1.font.bold = True
-                    p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
-                    p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
-                    
-                    left, top, width, height = Inches(0.5), Inches(2.5), Inches(12.3), Inches(4.5)
-                    txBox = slide_c.shapes.add_textbox(left, top, width, height)
-                    tf = txBox.text_frame; tf.word_wrap = True
-                    
-                    p_title = tf.add_paragraph()
-                    p_title.text = "【獨立項 Claim】"
-                    p_title.font.size = Pt(24); p_title.font.bold = True; p_title.font.color.rgb = RGBColor(0, 112, 192)
-                    p_title.space_after = Pt(10)
-                    
-                    for line in claim_lines:
-                        clean_line = line.strip()
-                        if clean_line:
-                            p = tf.add_paragraph()
-                            p.text = clean_line
-                            p.font.size = Pt(14) 
-                            p.space_after = Pt(4)
-                            
-                            if line.startswith('\t') or line.startswith('    '):
-                                p.level = 1
-                            elif clean_line.startswith(('o ', '○', '-', '•', '●')):
-                                p.level = 1
-                            elif clean_line.startswith(('▪', '■')):
-                                p.level = 2
-                            elif re.match(r'^(\(\d+\)|\d+\.|\d+\))', clean_line):
-                                if "Claim" in clean_line or "獨立項" in clean_line:
-                                    p.level = 0
-                                    p.font.bold = True
-                                else:
-                                    p.level = 1
-
-        return prs
-
-    st.divider()
-    if st.button("🚀 生成 PowerPoint (.pptx)", type="primary"):
-        prs = generate_ppt(st.session_state['slides_data'], add_claim_slide)
-        binary_output = BytesIO()
-        prs.save(binary_output)
-        binary_output.seek(0)
-        st.download_button("📥 下載 PPT", binary_output, "slides_with_claims.pptx")
-
-    st.divider()
-    st.subheader("📊 診斷報告")
-    if st.session_state['status_report']:
-        df = pd.DataFrame(st.session_state['status_report'])
-        cols = ["來源", "案號(公開號)", "公司", "日期(優先權日)", "對應PPT的頁碼", "狀態", "原因", "缺漏"]
-        st.dataframe(df[cols], hide_index=True)
