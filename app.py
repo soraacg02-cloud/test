@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V12 全域過濾版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V12 全域過濾版)")
-st.caption("更新：V12 將嚴格的「字數防火牆」與「語意過濾」同步應用於 OCR 識別結果。徹底解決掃描版 PDF 會誤抓摘要頁或說明頁的問題。")
+st.set_page_config(page_title="PPT 重組生成器 (V13 動態平衡版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V13 動態平衡版)")
+st.caption("更新：V13 調整防火牆邏輯。放寬字數限制以容納標號較多的圖片，改用「長段落檢測」來精準識別說明書內文。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -82,8 +82,8 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 核心函數：V12 全域雙重過濾 ---
-def extract_images_from_pdf_v12(pdf_stream, target_fig_text, case_key, debug=False):
+# --- 核心函數：V13 動態平衡版 ---
+def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=False):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
     
@@ -101,12 +101,19 @@ def extract_images_from_pdf_v12(pdf_stream, target_fig_text, case_key, debug=Fal
 
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # === 核心參數設定 ===
-        # 1. 全頁文字量防火牆 (OCR 與 原始文字 通用)
-        PAGE_TEXT_THRESHOLD = 150 
-        
-        # 2. 單行極限字數 (超過這個長度絕對不是圖號)
-        LINE_LENGTH_LIMIT = 25
+        # === V13 參數調教 ===
+        # 1. 總字數門檻放寬 (容納標號多的圖片)
+        # 一般滿版文字頁至少 1500 字以上。800 字足夠區分圖片與內文。
+        PAGE_TEXT_THRESHOLD_OCR = 800  
+        PAGE_TEXT_THRESHOLD_RAW = 600 # 原始文字層通常比較乾淨，門檻緊一點
+
+        # 2. 長段落檢測 (精準殺手)
+        # 如果一頁有超過 3 行「大於 80 字」的句子，判定為說明書
+        LONG_SENTENCE_LIMIT = 80 
+        MAX_LONG_SENTENCES = 3
+
+        # 3. 圖號行極限長度 (維持嚴格)
+        LINE_LENGTH_LIMIT = 30
 
         page_blacklist_headers = [
             "BRIEF DESCRIPTION", "DETAILED DESCRIPTION", "具体实施方式", "實施方式", 
@@ -130,13 +137,13 @@ def extract_images_from_pdf_v12(pdf_stream, target_fig_text, case_key, debug=Fal
             found_this_fig = False
 
             for i, page in enumerate(doc):
-                # 取得原始文字層
+                # --- A. 原始文字層分析 ---
                 blocks = page.get_text("blocks")
                 page_text_all = "".join([b[4] for b in blocks]).upper()
                 clean_page_text_all = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', page_text_all)
                 page_text_len = len(clean_page_text_all)
 
-                # 1. 頁面級黑名單檢查 (原始文字)
+                # 1. 黑名單標題
                 is_blacklist_page = False
                 for header in page_blacklist_headers:
                     if header in page_text_all:
@@ -145,21 +152,30 @@ def extract_images_from_pdf_v12(pdf_stream, target_fig_text, case_key, debug=Fal
                         break
                 if is_blacklist_page: continue
 
-                # 2. 文字量防火牆 (原始文字)
-                if page_text_len > PAGE_TEXT_THRESHOLD:
-                    if debug and i < 15: debug_logs.append(f"🚫 Skip P{i+1} (Text Layer Heavy: {page_text_len})")
+                # 2. V13 新邏輯：長段落檢測 (針對原始文字)
+                long_sentence_count = 0
+                for b in blocks:
+                    if len(re.sub(r'\s+', '', b[4])) > LONG_SENTENCE_LIMIT:
+                        long_sentence_count += 1
+                
+                if long_sentence_count > MAX_LONG_SENTENCES:
+                    if debug and i < 15: debug_logs.append(f"🚫 Skip P{i+1} (Raw: Too many long sentences: {long_sentence_count})")
                     continue
 
+                # 3. 字數防火牆 (Raw)
+                if page_text_len > PAGE_TEXT_THRESHOLD_RAW:
+                    if debug and i < 15: debug_logs.append(f"🚫 Skip P{i+1} (Raw Text Heavy: {page_text_len})")
+                    continue
+
+                # --- 策略 1: 原始文字層搜尋 ---
                 match_found_strategy_1 = False
-                
-                # === 策略 1: 原始文字層 (行級別 + 極限過濾) ===
                 for b in blocks:
                     block_text = b[4].strip()
                     clean_block_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', block_text).upper()
                     
                     for token in search_tokens:
                         if token in clean_block_text:
-                            # 極限長度檢查
+                            # 行長度檢查
                             if len(clean_block_text) > LINE_LENGTH_LIMIT:
                                 continue
                             
@@ -191,9 +207,8 @@ def extract_images_from_pdf_v12(pdf_stream, target_fig_text, case_key, debug=Fal
                     if found_this_fig: break
                     continue
 
-                # === 策略 2: 全頁級別 Fallback (原始文字) ===
-                # 只有當字數真的很少時才啟用
-                if page_text_len < PAGE_TEXT_THRESHOLD:
+                # --- 策略 2: 全頁級別 Fallback (Raw) ---
+                if page_text_len < PAGE_TEXT_THRESHOLD_RAW:
                     for token in search_tokens:
                         if token in clean_page_text_all:
                             idx = clean_page_text_all.find(token)
@@ -213,39 +228,49 @@ def extract_images_from_pdf_v12(pdf_stream, target_fig_text, case_key, debug=Fal
                     if found_this_fig: break
                     continue
 
-                # === 策略 3: OCR 模式 (V12 升級：加入過濾機制) ===
-                # 觸發條件：原始文字層字數極少 (< 50)
-                if page_text_len < 50:
+                # --- 策略 3: OCR 模式 (V13 動態平衡) ---
+                # 觸發條件：Raw 層沒找到，且 Raw 層字數不多 (避免對純文字頁做 OCR)
+                if page_text_len < 200: 
                     try:
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                         img_data = pix.tobytes("png")
                         pil_image = Image.open(BytesIO(img_data))
                         
                         ocr_text = pytesseract.image_to_string(pil_image, lang='eng+chi_tra', config='--psm 11')
-                        
-                        # V12 新增：檢查 OCR 讀出來的總字數
                         ocr_text_clean = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', ocr_text).upper()
                         ocr_len = len(ocr_text_clean)
 
                         if debug and i < 15: debug_logs.append(f"👁️ OCR P{i+1} Len: {ocr_len}")
 
-                        # V12 新增：如果 OCR 讀出太多字，代表這是一張掃描版的說明頁，跳過！
-                        if ocr_len > PAGE_TEXT_THRESHOLD:
+                        # V13: OCR 字數門檻放寬至 800
+                        if ocr_len > PAGE_TEXT_THRESHOLD_OCR:
                             if debug: debug_logs.append(f"   -> Skip P{i+1} (OCR Text Heavy: {ocr_len})")
                             continue
-
-                        # V12 新增：逐行檢查 OCR 結果 (而不是直接看有沒有 token)
+                        
+                        # V13: OCR 長段落檢測
                         ocr_lines = ocr_text.split('\n')
+                        long_sentence_count_ocr = 0
+                        for line in ocr_lines:
+                             clean_line_len = len(re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', line))
+                             if clean_line_len > LONG_SENTENCE_LIMIT:
+                                 long_sentence_count_ocr += 1
+                        
+                        if long_sentence_count_ocr > MAX_LONG_SENTENCES:
+                             if debug: debug_logs.append(f"   -> Skip P{i+1} (OCR: Too many long sentences: {long_sentence_count_ocr})")
+                             continue
+
+                        # OCR 逐行搜尋
                         for line in ocr_lines:
                             clean_line = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', line).upper()
                             
                             for token in search_tokens:
                                 if token in clean_line:
-                                    # V12: 對 OCR 的每一行也做極限過濾
+                                    # 行長度檢查
                                     if len(clean_line) > LINE_LENGTH_LIMIT:
-                                        if debug: debug_logs.append(f"   ⚠️ Skip OCR Line P{i+1}: too long")
+                                        if debug: debug_logs.append(f"   ⚠️ Skip OCR Line P{i+1}: too long ({len(clean_line)})")
                                         continue
                                     
+                                    # 語意檢查
                                     is_sentence_ocr = False
                                     for stopword in SENTENCE_STOPWORDS:
                                         if stopword in clean_line:
@@ -270,7 +295,7 @@ def extract_images_from_pdf_v12(pdf_stream, target_fig_text, case_key, debug=Fal
             st.session_state['debug_logs_map'][case_key] = "\n".join(debug_logs)
 
         if not found_page_indices:
-            return [], f"找不到圖號: {', '.join(target_numbers)} (已嘗試 V12 全域過濾)"
+            return [], f"找不到圖號: {', '.join(target_numbers)} (已嘗試 V13 動態平衡)"
 
         output_images = []
         for page_idx in sorted(list(found_page_indices)):
@@ -527,7 +552,7 @@ with st.sidebar:
                             break
                 
                 if matched_pdf:
-                    img_list, msg = extract_images_from_pdf_v12(matched_pdf, target_fig, case_key, debug=debug_mode)
+                    img_list, msg = extract_images_from_pdf_v13(matched_pdf, target_fig, case_key, debug=debug_mode)
                     if img_list:
                         case["image_list"] = img_list
                         status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
