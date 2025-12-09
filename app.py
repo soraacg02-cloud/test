@@ -15,9 +15,9 @@ import re
 import pandas as pd
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (短行鎖定版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (短行鎖定版)")
-st.caption("革新：改用「行級別特徵」判斷，只抓取圖號獨立成行的頁面，徹底排除說明書內文。")
+st.set_page_config(page_title="PPT 重組生成器 (V4 偵錯版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V4 偵錯版)")
+st.caption("革新：V4 核心邏輯 (放寬行字數限制 + 偵錯模式)，解決圖號被誤判為內文的問題。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -78,8 +78,8 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 函數：搜尋 PDF 多張截圖 (核心：V3 短行鎖定邏輯) ---
-def extract_images_from_pdf_v3(pdf_stream, target_fig_text):
+# --- 函數：搜尋 PDF 多張截圖 (V4: 寬鬆與偵錯版) ---
+def extract_images_from_pdf_v4(pdf_stream, target_fig_text, debug=False):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
     
@@ -88,7 +88,6 @@ def extract_images_from_pdf_v3(pdf_stream, target_fig_text):
         
         # 1. 解析 Word 中的目標圖號
         matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
-        
         # 備用：若 regex 失敗，嘗試抓第一行
         if not matches:
             first_line = target_fig_text.split('\n')[0].strip().upper()
@@ -99,7 +98,6 @@ def extract_images_from_pdf_v3(pdf_stream, target_fig_text):
         if not matches:
             return [], "無法識別任何圖號"
 
-        # 去重並排序
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
         # 2. 定義「絕對文字頁」的標題 (碰到這些標題就整頁跳過)
@@ -111,12 +109,11 @@ def extract_images_from_pdf_v3(pdf_stream, target_fig_text):
         ]
 
         found_page_indices = set()
-        log_found = []
+        debug_logs = [] # Debug 容器
 
         # 3. 遍歷每一個目標圖號
         for target_number in target_numbers:
-            
-            # 建立搜尋 Token (超級正規化)
+            # 建立搜尋 Token
             search_tokens = [
                 f"FIG{target_number}", 
                 f"FIGURE{target_number}",
@@ -127,8 +124,7 @@ def extract_images_from_pdf_v3(pdf_stream, target_fig_text):
             found_this_fig = False
 
             for i, page in enumerate(doc):
-                # 取得頁面文字區塊 (Blocks)，這樣可以逐行分析
-                # blocks 格式: (x0, y0, x1, y1, "text", block_no, block_type)
+                # 取得頁面文字區塊
                 blocks = page.get_text("blocks")
                 page_text_all = "".join([b[4] for b in blocks]).upper()
 
@@ -138,25 +134,28 @@ def extract_images_from_pdf_v3(pdf_stream, target_fig_text):
                     if header in page_text_all:
                         is_text_page = True
                         break
+                
+                # Debug: 顯示前幾頁的讀取狀況 (只在找第一個圖號時顯示，避免洗版)
+                if debug and i < 5 and target_number == target_numbers[0]:
+                    debug_logs.append(f"Page {i+1}: Text Length={len(page_text_all)}, IsTextPage={is_text_page}")
+                    if len(page_text_all) < 200: 
+                         debug_logs.append(f"   -> Content: {page_text_all[:100]}...")
+
                 if is_text_page: 
                     continue
 
-                # B. [行級別比對] 檢查每一行文字
-                # 我們要找的是: 包含圖號，且該行文字很短的 Block
+                # B. [行級別比對]
                 for b in blocks:
                     block_text = b[4].strip()
-                    # 正規化該行文字 (去空、轉大寫)
+                    # 正規化：去除非英數字與中文，轉大寫
                     clean_block_text = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', block_text).upper()
                     
                     for token in search_tokens:
-                        # 檢查 1: Token 是否存在於該行
                         if token in clean_block_text:
-                            # 檢查 2: [核心邏輯] 該行文字長度是否很短?
-                            # 圖片標題通常很短 (e.g., "FIG. 3E" 或 "图 3E")
-                            # 說明書內文通常很長 (e.g., "參照圖3E所示...")
-                            # 設定門檻：30 個字元 (容許一些雜訊)
-                            if len(clean_block_text) < 30:
-                                # 檢查 3: 邊界檢查 (避免 FIG2 抓到 FIG20)
+                            # 核心邏輯修正：放寬長度限制到 80 (原本30)
+                            # 這是為了允許 "FIG. 1 Schematic View" 這種情況
+                            if len(clean_block_text) < 80:
+                                # 邊界檢查 (避免 FIG1 抓到 FIG10)
                                 idx = clean_block_text.find(token)
                                 is_exact_match = True
                                 if idx != -1:
@@ -167,20 +166,28 @@ def extract_images_from_pdf_v3(pdf_stream, target_fig_text):
                                 
                                 if is_exact_match:
                                     found_page_indices.add(i)
-                                    log_found.append(target_number)
                                     found_this_fig = True
+                                    if debug: debug_logs.append(f"✅ Found {token} on Page {i+1} (Text: {clean_block_text})")
                                     break
-                    
                     if found_this_fig: break
                 if found_this_fig: break
         
+        # 顯示 Debug 資訊
+        if debug and debug_logs:
+            with st.expander(f"🔍 Debug: 圖號 {target_numbers} 搜尋日誌"):
+                st.text("\n".join(debug_logs))
+
         if not found_page_indices:
-            return [], f"找不到圖號: {', '.join(target_numbers)}"
+            # 若找不到，檢查是否整份 PDF 根本讀不到字 (掃描檔問題)
+            total_text_len = sum([len(page.get_text()) for page in doc])
+            if total_text_len < 100:
+                return [], "PDF 似乎沒有文字層 (可能是純圖片掃描檔)"
+            return [], f"找不到圖號: {', '.join(target_numbers)} (請嘗試開啟 Debug 模式檢查)"
 
         output_images = []
         for page_idx in sorted(list(found_page_indices)):
             page = doc[page_idx]
-            mat = fitz.Matrix(2, 2)
+            mat = fitz.Matrix(3, 3) # 提高解析度
             pix = page.get_pixmap(matrix=mat)
             output_images.append(pix.tobytes("png"))
 
@@ -369,6 +376,10 @@ with st.sidebar:
     st.divider()
     st.header("2. 輸出設定")
     add_claim_slide = st.checkbox("✅ 是否產生 Claim 分頁", value=False, help="勾選後，程式會自動識別獨立項數量，並為每一組獨立項產生一頁")
+    
+    st.divider()
+    st.header("3. 進階除錯")
+    debug_mode = st.checkbox("🐞 開啟偵錯模式 (Debug)", value=False, help="勾選後，會顯示 PDF 每一頁讀取到的文字，協助找出為什麼抓不到圖。")
 
     if word_files and st.button("🔄 開始智能整合", type="primary"):
         all_cases = []
@@ -419,7 +430,8 @@ with st.sidebar:
                             break
                 
                 if matched_pdf:
-                    img_list, msg = extract_images_from_pdf_v3(matched_pdf, target_fig)
+                    # 使用 V4 函數 (含 Debug)
+                    img_list, msg = extract_images_from_pdf_v4(matched_pdf, target_fig, debug=debug_mode)
                     if img_list:
                         case["image_list"] = img_list
                         status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
@@ -524,7 +536,7 @@ else:
             if need_claim_slide:
                 claims_groups = split_claims_text(data['claim_text'])
                 if not claims_groups and data['claim_text'].strip():
-                     claims_groups = [data['claim_text'].split('\n')]
+                      claims_groups = [data['claim_text'].split('\n')]
 
                 for claim_lines in claims_groups:
                     slide_c = prs.slides.add_slide(prs.slide_layouts[6])
