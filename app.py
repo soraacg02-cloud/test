@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V13 動態平衡版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V13 動態平衡版)")
-st.caption("更新：V13 調整防火牆邏輯。放寬字數限制以容納標號較多的圖片，改用「長段落檢測」來精準識別說明書內文。")
+st.set_page_config(page_title="PPT 重組生成器 (V14 Claim 配圖版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V14 Claim 配圖版)")
+st.caption("更新：V14 新增 Claim 分頁智慧配圖功能。自動偵測 Claim 文字中的圖號並抓取對應圖片；若無指定，則自動帶入代表圖。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -82,12 +82,16 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 核心函數：V13 動態平衡版 ---
-def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=False):
+# --- 核心函數：V13 動態平衡版邏輯 (保留不變) ---
+def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=False, log_prefix=""):
     if not target_fig_text:
-        return [], "Word 中未指定代表圖文字"
+        return [], f"{log_prefix}未指定圖號"
     
     try:
+        # 重設指標，確保可以重複讀取
+        if hasattr(pdf_stream, 'seek'):
+            pdf_stream.seek(0)
+            
         doc = fitz.open(stream=pdf_stream, filetype="pdf")
         
         matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', target_fig_text, re.IGNORECASE)
@@ -97,22 +101,15 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
             if fallback: matches = [fallback.group(1)]
 
         if not matches:
-            return [], "無法識別任何圖號"
+            return [], f"{log_prefix}無法識別任何圖號"
 
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # === V13 參數調教 ===
-        # 1. 總字數門檻放寬 (容納標號多的圖片)
-        # 一般滿版文字頁至少 1500 字以上。800 字足夠區分圖片與內文。
+        # === V13 參數 ===
         PAGE_TEXT_THRESHOLD_OCR = 800  
-        PAGE_TEXT_THRESHOLD_RAW = 600 # 原始文字層通常比較乾淨，門檻緊一點
-
-        # 2. 長段落檢測 (精準殺手)
-        # 如果一頁有超過 3 行「大於 80 字」的句子，判定為說明書
+        PAGE_TEXT_THRESHOLD_RAW = 600 
         LONG_SENTENCE_LIMIT = 80 
         MAX_LONG_SENTENCES = 3
-
-        # 3. 圖號行極限長度 (維持嚴格)
         LINE_LENGTH_LIMIT = 30
 
         page_blacklist_headers = [
@@ -126,7 +123,7 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
 
         found_page_indices = set()
         debug_logs = [] 
-        debug_logs.append(f"🎯 目標圖號: {target_numbers}")
+        debug_logs.append(f"{log_prefix}🎯 目標: {target_numbers}")
 
         for target_number in target_numbers:
             search_tokens = [
@@ -137,34 +134,34 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
             found_this_fig = False
 
             for i, page in enumerate(doc):
-                # --- A. 原始文字層分析 ---
+                # --- A. 原始文字層 ---
                 blocks = page.get_text("blocks")
                 page_text_all = "".join([b[4] for b in blocks]).upper()
                 clean_page_text_all = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', page_text_all)
                 page_text_len = len(clean_page_text_all)
 
-                # 1. 黑名單標題
+                # 1. 黑名單
                 is_blacklist_page = False
                 for header in page_blacklist_headers:
                     if header in page_text_all:
                         is_blacklist_page = True
-                        if debug and i < 15: debug_logs.append(f"🚫 Skip P{i+1} (Header: {header})")
+                        if debug and i < 15: debug_logs.append(f"{log_prefix}🚫 Skip P{i+1} (Header: {header})")
                         break
                 if is_blacklist_page: continue
 
-                # 2. V13 新邏輯：長段落檢測 (針對原始文字)
+                # 2. 長段落檢測
                 long_sentence_count = 0
                 for b in blocks:
                     if len(re.sub(r'\s+', '', b[4])) > LONG_SENTENCE_LIMIT:
                         long_sentence_count += 1
                 
                 if long_sentence_count > MAX_LONG_SENTENCES:
-                    if debug and i < 15: debug_logs.append(f"🚫 Skip P{i+1} (Raw: Too many long sentences: {long_sentence_count})")
+                    if debug and i < 15: debug_logs.append(f"{log_prefix}🚫 Skip P{i+1} (Raw: Long sentences)")
                     continue
 
                 # 3. 字數防火牆 (Raw)
                 if page_text_len > PAGE_TEXT_THRESHOLD_RAW:
-                    if debug and i < 15: debug_logs.append(f"🚫 Skip P{i+1} (Raw Text Heavy: {page_text_len})")
+                    if debug and i < 15: debug_logs.append(f"{log_prefix}🚫 Skip P{i+1} (Raw Heavy: {page_text_len})")
                     continue
 
                 # --- 策略 1: 原始文字層搜尋 ---
@@ -175,11 +172,8 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                     
                     for token in search_tokens:
                         if token in clean_block_text:
-                            # 行長度檢查
-                            if len(clean_block_text) > LINE_LENGTH_LIMIT:
-                                continue
+                            if len(clean_block_text) > LINE_LENGTH_LIMIT: continue
                             
-                            # 語意檢查
                             is_sentence = False
                             for stopword in SENTENCE_STOPWORDS:
                                 if stopword in clean_block_text:
@@ -187,7 +181,6 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                                     break
                             if is_sentence: continue 
 
-                            # 邊界檢查
                             idx = clean_block_text.find(token)
                             is_exact_match = True
                             if idx != -1:
@@ -199,7 +192,7 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                                 found_page_indices.add(i)
                                 found_this_fig = True
                                 match_found_strategy_1 = True
-                                if debug: debug_logs.append(f"✅ Found {token} (Text Layer) on P{i+1}")
+                                if debug: debug_logs.append(f"{log_prefix}✅ Found {token} (Text Layer) on P{i+1}")
                                 break
                     if match_found_strategy_1: break
                 
@@ -207,7 +200,7 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                     if found_this_fig: break
                     continue
 
-                # --- 策略 2: 全頁級別 Fallback (Raw) ---
+                # --- 策略 2: Fallback (Raw) ---
                 if page_text_len < PAGE_TEXT_THRESHOLD_RAW:
                     for token in search_tokens:
                         if token in clean_page_text_all:
@@ -221,15 +214,14 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                                 found_page_indices.add(i)
                                 found_this_fig = True
                                 match_found_strategy_1 = True
-                                if debug: debug_logs.append(f"✅ Found {token} (Full Page Text) on P{i+1}")
+                                if debug: debug_logs.append(f"{log_prefix}✅ Found {token} (Full Page) on P{i+1}")
                                 break
                 
                 if match_found_strategy_1:
                     if found_this_fig: break
                     continue
 
-                # --- 策略 3: OCR 模式 (V13 動態平衡) ---
-                # 觸發條件：Raw 層沒找到，且 Raw 層字數不多 (避免對純文字頁做 OCR)
+                # --- 策略 3: OCR 模式 ---
                 if page_text_len < 200: 
                     try:
                         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
@@ -240,14 +232,12 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                         ocr_text_clean = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', ocr_text).upper()
                         ocr_len = len(ocr_text_clean)
 
-                        if debug and i < 15: debug_logs.append(f"👁️ OCR P{i+1} Len: {ocr_len}")
+                        if debug and i < 15: debug_logs.append(f"{log_prefix}👁️ OCR P{i+1} Len: {ocr_len}")
 
-                        # V13: OCR 字數門檻放寬至 800
                         if ocr_len > PAGE_TEXT_THRESHOLD_OCR:
-                            if debug: debug_logs.append(f"   -> Skip P{i+1} (OCR Text Heavy: {ocr_len})")
+                            if debug: debug_logs.append(f"{log_prefix}   -> Skip P{i+1} (OCR Heavy)")
                             continue
                         
-                        # V13: OCR 長段落檢測
                         ocr_lines = ocr_text.split('\n')
                         long_sentence_count_ocr = 0
                         for line in ocr_lines:
@@ -256,46 +246,42 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
                                  long_sentence_count_ocr += 1
                         
                         if long_sentence_count_ocr > MAX_LONG_SENTENCES:
-                             if debug: debug_logs.append(f"   -> Skip P{i+1} (OCR: Too many long sentences: {long_sentence_count_ocr})")
+                             if debug: debug_logs.append(f"{log_prefix}   -> Skip P{i+1} (OCR Long Sentences)")
                              continue
 
-                        # OCR 逐行搜尋
                         for line in ocr_lines:
                             clean_line = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', line).upper()
                             
                             for token in search_tokens:
                                 if token in clean_line:
-                                    # 行長度檢查
-                                    if len(clean_line) > LINE_LENGTH_LIMIT:
-                                        if debug: debug_logs.append(f"   ⚠️ Skip OCR Line P{i+1}: too long ({len(clean_line)})")
-                                        continue
+                                    if len(clean_line) > LINE_LENGTH_LIMIT: continue
                                     
-                                    # 語意檢查
                                     is_sentence_ocr = False
                                     for stopword in SENTENCE_STOPWORDS:
                                         if stopword in clean_line:
                                             is_sentence_ocr = True
                                             break
-                                    if is_sentence_ocr:
-                                        if debug: debug_logs.append(f"   ⚠️ Skip OCR Line P{i+1}: semantic")
-                                        continue
+                                    if is_sentence_ocr: continue
 
                                     found_page_indices.add(i)
                                     found_this_fig = True
-                                    if debug: debug_logs.append(f"✅ Found {token} (OCR Strict) on P{i+1}")
+                                    if debug: debug_logs.append(f"{log_prefix}✅ Found {token} (OCR) on P{i+1}")
                                     break
                             if found_this_fig: break
 
                     except Exception as ocr_e:
-                        if debug: debug_logs.append(f"⚠️ OCR Error on P{i+1}: {ocr_e}")
+                        if debug: debug_logs.append(f"{log_prefix}⚠️ OCR Error on P{i+1}: {ocr_e}")
 
                 if found_this_fig: break
         
+        # 儲存 Log (Append 模式)
         if debug:
-            st.session_state['debug_logs_map'][case_key] = "\n".join(debug_logs)
+            if case_key not in st.session_state['debug_logs_map']:
+                st.session_state['debug_logs_map'][case_key] = ""
+            st.session_state['debug_logs_map'][case_key] += "\n".join(debug_logs) + "\n\n"
 
         if not found_page_indices:
-            return [], f"找不到圖號: {', '.join(target_numbers)} (已嘗試 V13 動態平衡)"
+            return [], f"{log_prefix}找不到圖號: {', '.join(target_numbers)}"
 
         output_images = []
         for page_idx in sorted(list(found_page_indices)):
@@ -304,10 +290,10 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
             pix = page.get_pixmap(matrix=mat)
             output_images.append(pix.tobytes("png"))
 
-        return output_images, f"成功 (共{len(output_images)}張)"
+        return output_images, f"成功 ({len(output_images)}張)"
 
     except Exception as e:
-        return [], f"PDF 解析錯誤: {str(e)}"
+        return [], f"{log_prefix}PDF 解析錯誤: {str(e)}"
 
 # --- 函數：提取專利號 等 ---
 def extract_patent_number_from_text(text):
@@ -366,7 +352,7 @@ def parse_word_file(uploaded_docx):
         cases = []
         current_case = {
             "case_info": "", "problem": "", "spirit": "", "key_point": "", "rep_fig_text": "", "claim_text": "",
-            "image_list": [], "image_name": "Word匯入", "raw_case_no": "",
+            "image_list": [], "claim_image_list": [], "image_name": "Word匯入", "raw_case_no": "",
             "clean_number": "", "clean_date": "", "clean_company": "", 
             "sort_date": "99999999", "sort_company": "ZZZ",
             "source_file": uploaded_docx.name, "missing_fields": []
@@ -394,7 +380,7 @@ def parse_word_file(uploaded_docx):
                     cases.append(current_case)
                     current_case = {
                         "case_info": "", "problem": "", "spirit": "", "key_point": "", "rep_fig_text": "", "claim_text": "",
-                        "image_list": [], "image_name": "Word匯入", "raw_case_no": "",
+                        "image_list": [], "claim_image_list": [], "image_name": "Word匯入", "raw_case_no": "",
                         "clean_number": "", "clean_date": "", "clean_company": "",
                         "sort_date": "99999999", "sort_company": "ZZZ",
                         "source_file": uploaded_docx.name, "missing_fields": []
@@ -475,6 +461,15 @@ def split_claims_text(full_text):
     if current_chunk and "".join(current_chunk).strip(): claims.append(current_chunk)
     return claims
 
+def parse_fig_number_from_claim(claim_text):
+    """從 Claim 文字中偵測是否有指定特定圖號"""
+    if not claim_text: return None
+    # 找尋 (FIG. X) 或 (圖 X) 或 圖X 所示
+    matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', claim_text, re.IGNORECASE)
+    if matches:
+        return "FIG. " + ", FIG. ".join(sorted(list(set(matches))))
+    return None
+
 # --- 側邊欄 ---
 with st.sidebar:
     st.header("1. 匯入資料")
@@ -520,11 +515,12 @@ with st.sidebar:
             for case in all_cases:
                 case_key = case["raw_case_no"]
                 target_fig = case["rep_fig_text"]
+                claim_text_content = case["claim_text"]
                 
                 pages_this_case = 1 
                 if add_claim_slide:
-                    c_groups = split_claims_text(case["claim_text"])
-                    if not c_groups and case["claim_text"].strip(): pages_this_case += 1
+                    c_groups = split_claims_text(claim_text_content)
+                    if not c_groups and claim_text_content.strip(): pages_this_case += 1
                     else: pages_this_case += len(c_groups)
                 
                 start_page = current_ppt_page
@@ -552,13 +548,34 @@ with st.sidebar:
                             break
                 
                 if matched_pdf:
-                    img_list, msg = extract_images_from_pdf_v13(matched_pdf, target_fig, case_key, debug=debug_mode)
-                    if img_list:
-                        case["image_list"] = img_list
-                        status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
+                    # 1. 抓取主要代表圖 (Main Slide)
+                    img_list_main, msg_main = extract_images_from_pdf_v13(matched_pdf, target_fig, case_key, debug=debug_mode, log_prefix="[Main] ")
+                    
+                    # 2. 抓取 Claim 附圖 (V14 Feature)
+                    # 檢查 Claim 文字中有無指定圖號
+                    specific_claim_fig = parse_fig_number_from_claim(claim_text_content)
+                    
+                    img_list_claim = []
+                    msg_claim = ""
+                    
+                    if specific_claim_fig:
+                        # 如果有指定，去 PDF 抓那張圖
+                        img_list_claim, msg_claim = extract_images_from_pdf_v13(matched_pdf, specific_claim_fig, case_key, debug=debug_mode, log_prefix="[Claim] ")
+                        if not img_list_claim: # 抓不到就回退用主圖
+                             img_list_claim = img_list_main
+                             msg_claim = "Claim圖抓取失敗，使用主圖"
+                    else:
+                        # 沒指定就用主圖
+                        img_list_claim = img_list_main
+                        msg_claim = "Claim未指定圖，使用主圖"
+
+                    if img_list_main:
+                        case["image_list"] = img_list_main
+                        case["claim_image_list"] = img_list_claim # 存入 Claim 圖片
+                        status["狀態"] = f"✅ 成功 ({len(img_list_main)}張)"
                         match_count += 1
                     else:
-                        status["狀態"] = "⚠️ 缺圖"; status["原因"] = msg
+                        status["狀態"] = "⚠️ 缺圖"; status["原因"] = msg_main
                 else:
                     if not target_fig: status["狀態"] = "⚠️ 缺資訊"; status["原因"] = "Word無代表圖"
                     else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key}"
@@ -592,9 +609,12 @@ else:
                 st.caption(f"{data['clean_company']} | {data['clean_date']}")
                 st.text(f"{data['clean_number']}")
                 if data['image_list']:
-                    st.image(data['image_list'][0], caption=f"共 {len(data['image_list'])} 張圖", use_column_width=True)
-                else:
-                    st.warning("無圖片")
+                    st.image(data['image_list'][0], caption=f"主圖 ({len(data['image_list'])})", use_column_width=True)
+                
+                # V14: 顯示 Claim 圖片預覽
+                if data.get('claim_image_list'):
+                     st.image(data['claim_image_list'][0], caption=f"Claim 用圖 ({len(data['claim_image_list'])})", use_column_width=True)
+                
                 full_claim_text = data['claim_text']
                 claims_preview = split_claims_text(full_claim_text)
                 count_claims = len(claims_preview) if full_claim_text else 0
@@ -605,6 +625,7 @@ else:
         prs.slide_width = Inches(13.333)
         prs.slide_height = Inches(7.5)
         for data in slides_data:
+            # === Main Slide ===
             slide = prs.slides.add_slide(prs.slide_layouts[6])
             
             left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
@@ -654,6 +675,7 @@ else:
             p = shape.text_frame.paragraphs[0]; p.text = data['key_point']; p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(20); p.font.bold = True
             shape.text_frame.vertical_anchor = MSO_SHAPE.RECTANGLE
 
+            # === Claim Slides (V14 Updated) ===
             if need_claim_slide:
                 claims_groups = split_claims_text(data['claim_text'])
                 if not claims_groups and data['claim_text'].strip():
@@ -669,7 +691,23 @@ else:
                     p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
                     p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
                     
+                    # V14: 插入 Claim 圖片 (與 Main Slide 右上角相同位置)
+                    claim_imgs = data.get('claim_image_list', [])
+                    if claim_imgs:
+                        img_left = Inches(5.5); img_top = Inches(0.5); 
+                        num_imgs = len(claim_imgs)
+                        img_w = (7.0 / num_imgs) - 0.1
+                        img_h = 3.0
+                        for idx, img_bytes in enumerate(claim_imgs):
+                            this_left = 5.5 + (idx * (img_w + 0.1))
+                            slide_c.shapes.add_picture(BytesIO(img_bytes), Inches(this_left), Inches(0.5), height=Inches(img_h))
+
                     left, top, width, height = Inches(0.5), Inches(2.5), Inches(12.3), Inches(4.5)
+                    # 如果有圖，文字框稍微往下移一點，避免蓋到圖
+                    if claim_imgs:
+                         top = Inches(3.6)
+                         height = Inches(3.4)
+
                     txBox = slide_c.shapes.add_textbox(left, top, width, height)
                     tf = txBox.text_frame; tf.word_wrap = True
                     
