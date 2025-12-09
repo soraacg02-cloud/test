@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V7 穩定按鈕版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V7 穩定按鈕版)")
-st.caption("革新：V7 修正按鈕消失問題，並保留 OCR 識別功能。")
+st.set_page_config(page_title="PPT 重組生成器 (V8 按鈕解鎖版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V8 按鈕解鎖版)")
+st.caption("更新：解除按鈕鎖定邏輯，確保按鈕隨時可點擊。保留 OCR 強力辨識功能。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -80,7 +80,7 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 核心函數：V6/V7 OCR 增強版 ---
+# --- 核心函數：OCR 增強版 ---
 def extract_images_from_pdf_v6(pdf_stream, target_fig_text, debug=False):
     if not target_fig_text:
         return [], "Word 中未指定代表圖文字"
@@ -384,7 +384,7 @@ def split_claims_text(full_text):
     if current_chunk and "".join(current_chunk).strip(): claims.append(current_chunk)
     return claims
 
-# --- 側邊欄 (修正按鈕邏輯) ---
+# --- 側邊欄 (V8 修正：解除按鈕鎖定) ---
 with st.sidebar:
     st.header("1. 匯入資料")
     word_files = st.file_uploader("Word 檔案 (可多選)", type=['docx'], accept_multiple_files=True)
@@ -398,11 +398,14 @@ with st.sidebar:
     debug_mode = st.checkbox("🐞 開啟偵錯模式 (Debug)", value=False, help="勾選後，會顯示詳細的識別日誌，包含 OCR 的辨識結果。")
 
     st.divider()
-    # === V7 修正重點：強制按鈕顯示，若無檔案則 disable ===
-    btn_disabled = not word_files # 如果沒有 Word 檔案，就禁用按鈕
-    run_btn = st.button("🔄 開始智能整合", type="primary", disabled=btn_disabled)
+    # === V8 修改：移除 disabled 參數，改為點擊後檢查 ===
+    run_btn = st.button("🔄 開始智能整合", type="primary")
 
     if run_btn:
+        if not word_files:
+            st.warning("⚠️ 請先上傳 Word 檔案！")
+            st.stop()
+
         all_cases = []
         status_report_list = []
         for wf in word_files: all_cases.extend(parse_word_file(wf))
@@ -428,3 +431,188 @@ with st.sidebar:
                 
                 start_page = current_ppt_page
                 end_page = current_ppt_page + pages_this_case - 1
+                page_str = f"P{start_page}" if start_page == end_page else f"P{start_page}-P{end_page}"
+                current_ppt_page += pages_this_case
+
+                status = {
+                    "來源": case["source_file"], 
+                    "案號(公開號)": case["clean_number"],
+                    "公司": case["clean_company"],
+                    "日期(優先權日)": case["clean_date"],
+                    "對應PPT的頁碼": page_str,
+                    "狀態": "未處理", "原因": "", "缺漏": ", ".join(case["missing_fields"])
+                }
+                
+                matched_pdf = None
+                norm_case_key = normalize_string(case_key)
+                
+                for pdf_name, pdf_bytes in pdf_file_map.items():
+                    norm_pdf_name = normalize_string(pdf_name)
+                    if norm_case_key and ((norm_case_key in norm_pdf_name) or (norm_pdf_name in norm_case_key)):
+                        if len(norm_case_key) > 5:
+                            matched_pdf = pdf_bytes
+                            break
+                
+                if matched_pdf:
+                    img_list, msg = extract_images_from_pdf_v6(matched_pdf, target_fig, debug=debug_mode)
+                    if img_list:
+                        case["image_list"] = img_list
+                        status["狀態"] = f"✅ 成功 ({len(img_list)}張)"
+                        match_count += 1
+                    else:
+                        status["狀態"] = "⚠️ 缺圖"; status["原因"] = msg
+                else:
+                    if not target_fig: status["狀態"] = "⚠️ 缺資訊"; status["原因"] = "Word無代表圖"
+                    else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key}"
+                status_report_list.append(status)
+
+        if all_cases:
+            st.session_state['slides_data'] = all_cases
+            st.session_state['status_report'] = status_report_list
+            st.success(f"完成！共 {len(all_cases)} 筆資料。")
+        else:
+            st.warning("無資料。")
+
+    if st.session_state['slides_data']:
+        st.divider()
+        if st.button("🗑️ 清除重來"):
+            st.session_state['slides_data'] = []
+            st.session_state['status_report'] = []
+            st.rerun()
+
+# --- 主畫面 ---
+if not st.session_state['slides_data']:
+    st.info("👈 請先上傳檔案。")
+else:
+    st.subheader(f"📋 預覽 (已排序: 申請人 -> 日期)")
+    cols = st.columns(3)
+    for i, data in enumerate(st.session_state['slides_data']):
+        with cols[i % 3]:
+            with st.container(border=True):
+                st.markdown(f"**Case {i+1}**")
+                st.caption(f"{data['clean_company']} | {data['clean_date']}")
+                st.text(f"{data['clean_number']}")
+                if data['image_list']:
+                    st.image(data['image_list'][0], caption=f"共 {len(data['image_list'])} 張圖", use_column_width=True)
+                else:
+                    st.warning("無圖片")
+                full_claim_text = data['claim_text']
+                claims_preview = split_claims_text(full_claim_text)
+                count_claims = len(claims_preview) if full_claim_text else 0
+                st.caption(f"Claim: {count_claims} 組")
+
+    def generate_ppt(slides_data, need_claim_slide):
+        prs = Presentation()
+        prs.slide_width = Inches(13.333)
+        prs.slide_height = Inches(7.5)
+        for data in slides_data:
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            
+            left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
+            txBox = slide.shapes.add_textbox(left, top, width, height)
+            tf = txBox.text_frame; tf.word_wrap = True
+            p1 = tf.add_paragraph(); p1.text = f"公開號：{data['clean_number']}"; p1.font.size = Pt(20); p1.font.bold = True
+            p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
+            p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
+
+            img_left = Inches(5.5); img_top = Inches(0.5); img_width = Inches(7.0)
+            img_list = data.get('image_list', [])
+            
+            if img_list:
+                num_imgs = len(img_list)
+                img_w = (7.0 / num_imgs) - 0.1
+                img_h = 3.0
+                for idx, img_bytes in enumerate(img_list):
+                    this_left = 5.5 + (idx * (img_w + 0.1))
+                    slide.shapes.add_picture(BytesIO(img_bytes), Inches(this_left), Inches(0.5), height=Inches(img_h))
+                
+                text_top = Inches(3.6)
+                text_height = Inches(1.0)
+                txBox = slide.shapes.add_textbox(img_left, text_top, img_width, text_height)
+                tf = txBox.text_frame; tf.word_wrap = True
+                content = data['rep_fig_text'] if data['rep_fig_text'].strip() else ""
+                for line in content.split('\n'):
+                    if line.strip():
+                        p = tf.add_paragraph(); p.text = line.strip(); p.font.size = Pt(14)
+            else:
+                img_height = Inches(4.0)
+                txBox = slide.shapes.add_textbox(img_left, img_top, img_width, img_height)
+                tf = txBox.text_frame; tf.word_wrap = True
+                content = data['rep_fig_text'] if data['rep_fig_text'].strip() else "無代表圖資訊"
+                for line in content.split('\n'):
+                    if line.strip():
+                        p = tf.add_paragraph(); p.text = line.strip(); p.font.size = Pt(16)
+
+            left, top, width, height = Inches(0.5), Inches(4.8), Inches(12.3), Inches(1.5)
+            txBox = slide.shapes.add_textbox(left, top, width, height)
+            tf = txBox.text_frame; tf.word_wrap = True
+            p1 = tf.add_paragraph(); p1.text = "• 解決問題：" + data['problem']; p1.font.size = Pt(18); p1.space_after = Pt(12)
+            p2 = tf.add_paragraph(); p2.text = "• 發明精神：" + data['spirit']; p2.font.size = Pt(18)
+
+            left, top, width, height = Inches(0.5), Inches(6.5), Inches(12.3), Inches(0.8)
+            shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
+            shape.fill.solid(); shape.fill.fore_color.rgb = RGBColor(255, 192, 0); shape.line.color.rgb = RGBColor(255, 192, 0)
+            p = shape.text_frame.paragraphs[0]; p.text = data['key_point']; p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(20); p.font.bold = True
+            shape.text_frame.vertical_anchor = MSO_SHAPE.RECTANGLE
+
+            if need_claim_slide:
+                claims_groups = split_claims_text(data['claim_text'])
+                if not claims_groups and data['claim_text'].strip():
+                      claims_groups = [data['claim_text'].split('\n')]
+
+                for claim_lines in claims_groups:
+                    slide_c = prs.slides.add_slide(prs.slide_layouts[6])
+                    
+                    left, top, width, height = Inches(0.5), Inches(0.5), Inches(5.0), Inches(2.0)
+                    txBox = slide_c.shapes.add_textbox(left, top, width, height)
+                    tf = txBox.text_frame; tf.word_wrap = True
+                    p1 = tf.add_paragraph(); p1.text = f"公開號：{data['clean_number']}"; p1.font.size = Pt(20); p1.font.bold = True
+                    p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
+                    p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
+                    
+                    left, top, width, height = Inches(0.5), Inches(2.5), Inches(12.3), Inches(4.5)
+                    txBox = slide_c.shapes.add_textbox(left, top, width, height)
+                    tf = txBox.text_frame; tf.word_wrap = True
+                    
+                    p_title = tf.add_paragraph()
+                    p_title.text = "【獨立項 Claim】"
+                    p_title.font.size = Pt(24); p_title.font.bold = True; p_title.font.color.rgb = RGBColor(0, 112, 192)
+                    p_title.space_after = Pt(10)
+                    
+                    for line in claim_lines:
+                        clean_line = line.strip()
+                        if clean_line:
+                            p = tf.add_paragraph()
+                            p.text = clean_line
+                            p.font.size = Pt(14) 
+                            p.space_after = Pt(4)
+                            
+                            if line.startswith('\t') or line.startswith('    '):
+                                p.level = 1
+                            elif clean_line.startswith(('o ', '○', '-', '•', '●')):
+                                p.level = 1
+                            elif clean_line.startswith(('▪', '■')):
+                                p.level = 2
+                            elif re.match(r'^(\(\d+\)|\d+\.|\d+\))', clean_line):
+                                if "Claim" in clean_line or "獨立項" in clean_line:
+                                    p.level = 0
+                                    p.font.bold = True
+                                else:
+                                    p.level = 1
+
+        return prs
+
+    st.divider()
+    if st.button("🚀 生成 PowerPoint (.pptx)", type="primary"):
+        prs = generate_ppt(st.session_state['slides_data'], add_claim_slide)
+        binary_output = BytesIO()
+        prs.save(binary_output)
+        binary_output.seek(0)
+        st.download_button("📥 下載 PPT", binary_output, "slides_with_claims.pptx")
+
+    st.divider()
+    st.subheader("📊 診斷報告")
+    if st.session_state['status_report']:
+        df = pd.DataFrame(st.session_state['status_report'])
+        cols = ["來源", "案號(公開號)", "公司", "日期(優先權日)", "對應PPT的頁碼", "狀態", "原因", "缺漏"]
+        st.dataframe(df[cols], hide_index=True)
