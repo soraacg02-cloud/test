@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V18 超級清洗版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V18 超級清洗版)")
-st.caption("更新：V18 加入「超級清洗」邏輯，自動移除案號中的斜線(/)、點(.)、逗號(,)與連字號(-)，確保能與純英數的 PDF 檔名完美匹配。並新增 PDF 配對診斷日誌。")
+st.set_page_config(page_title="PPT 重組生成器 (V18 核心數字比對版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V18 核心數字比對版)")
+st.caption("更新：V18 採用「核心數字比對」策略。無視 PDF 檔名中的補零 (000) 或後綴 (p)，只要案號中的「純數字序列」相符，即可成功配對。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -714,7 +714,6 @@ else:
             p = shape.text_frame.paragraphs[0]; p.text = data['key_point']; p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(20); p.font.bold = True
             shape.text_frame.vertical_anchor = MSO_SHAPE.RECTANGLE
 
-            # === Claim Slides ===
             if need_claim_slide:
                 claims_groups = split_claims_text(data['claim_text'])
                 if not claims_groups and data['claim_text'].strip():
