@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V17 寬鬆比對版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V17 寬鬆比對版)")
-st.caption("更新：V17 加入「核心數字比對」機制。當 PDF 檔名包含額外的零 (如 us000123...) 時，程式能透過識別關鍵數字串 (如 123) 成功找到對應檔案。")
+st.set_page_config(page_title="PPT 重組生成器 (V18 超級清洗版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V18 超級清洗版)")
+st.caption("更新：V18 加入「超級清洗」邏輯，自動移除案號中的斜線(/)、點(.)、逗號(,)與連字號(-)，確保能與純英數的 PDF 檔名完美匹配。並新增 PDF 配對診斷日誌。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -69,6 +69,8 @@ if 'status_report' not in st.session_state:
     st.session_state['status_report'] = []
 if 'debug_logs_map' not in st.session_state:
     st.session_state['debug_logs_map'] = {}
+if 'pdf_match_logs' not in st.session_state: # V18: 新增 PDF 配對日誌
+    st.session_state['pdf_match_logs'] = []
 
 # --- 輔助函數：遍歷 Word ---
 def iter_block_items(parent):
@@ -266,6 +268,7 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
 
                 if found_this_fig: break
         
+        # 儲存 Log (Append 模式)
         if debug:
             if case_key not in st.session_state['debug_logs_map']:
                 st.session_state['debug_logs_map'][case_key] = ""
@@ -286,7 +289,7 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
     except Exception as e:
         return [], f"{log_prefix}PDF 解析錯誤: {str(e)}"
 
-# --- 函數：提取專利號 (V16 修正：去除逗號) ---
+# --- 函數：提取專利號 (V18 修正：超級清洗) ---
 def extract_patent_number_from_text(text):
     if "：" in text: text = text.replace("：", ":")
     if ":" in text:
@@ -294,7 +297,10 @@ def extract_patent_number_from_text(text):
     else:
         content = text
 
-    clean_text = content.replace(" ", "").replace(",", "").strip().upper()
+    # V18: 超級清洗 (去除 空白, 逗號, 斜線, 連字號, 點)
+    clean_text = content.replace(" ", "").replace(",", "").replace("/", "").replace("-", "").replace(".", "").strip().upper()
+    
+    # 放寬 Regex: 國碼 + 數字 (不強求後綴，只要有數字)
     match = re.search(r'([A-Z]{2,4}\d{4,}[A-Z0-9]*)', clean_text)
     if match: return match.group(1)
     
@@ -478,18 +484,25 @@ with st.sidebar:
     st.divider()
     st.header("3. 進階除錯")
     debug_mode = st.checkbox("🐞 開啟偵錯模式 (Debug)", value=False, help="勾選後，會顯示詳細的識別日誌，包含 OCR 的辨識結果。")
+    show_pdf_log = st.checkbox("🔍 顯示 PDF 配對日誌", value=False, help="若找不到 PDF，勾選此項可查看程式嘗試配對的過程。")
     
     if debug_mode and st.session_state['debug_logs_map']:
-        st.caption("📜 歷史 Debug 紀錄 (點擊展開)")
+        st.caption("📜 歷史 Debug 紀錄 (圖片搜尋)")
         for key, log in st.session_state['debug_logs_map'].items():
             with st.expander(f"Case: {key}"):
                 st.text(log)
+    
+    if show_pdf_log and st.session_state.get('pdf_match_logs'):
+        st.caption("📂 PDF 配對紀錄 (檔案搜尋)")
+        with st.expander("查看配對過程"):
+            st.text("\n".join(st.session_state['pdf_match_logs']))
 
     st.divider()
     run_btn = st.button("🔄 開始智能整合", type="primary")
 
     if run_btn:
         st.session_state['debug_logs_map'] = {}
+        st.session_state['pdf_match_logs'] = [] # Clear logs
         
         if not word_files:
             st.warning("⚠️ 請先上傳 Word 檔案！")
@@ -537,23 +550,30 @@ with st.sidebar:
                 matched_pdf = None
                 norm_case_key = normalize_string(case_key)
                 
-                # === V17 修正：寬鬆比對邏輯 (Smart Matching) ===
+                # === V18: PDF 配對邏輯 (含日誌) ===
+                if show_pdf_log:
+                    st.session_state['pdf_match_logs'].append(f"\n--- Matching Case: {case_key} (Norm: {norm_case_key}) ---")
+
                 for pdf_name, pdf_bytes in pdf_file_map.items():
                     norm_pdf_name = normalize_string(pdf_name)
                     
-                    # 1. 精準比對 (舊邏輯)
+                    # 1. 精準比對
                     if norm_case_key and ((norm_case_key in norm_pdf_name) or (norm_pdf_name in norm_case_key)):
                         if len(norm_case_key) > 5:
                             matched_pdf = pdf_bytes
+                            if show_pdf_log: st.session_state['pdf_match_logs'].append(f"✅ Match Found (Exact): {pdf_name}")
                             break
                     
-                    # 2. 核心數字比對 (新邏輯)
-                    # 提取 Case 中的純數字: US11226533B2 -> 11226533
+                    # 2. 核心數字比對 (US11226533B2 -> 11226533)
                     case_digits = re.sub(r'\D', '', case_key)
                     if len(case_digits) >= 4 and case_digits in norm_pdf_name:
                         matched_pdf = pdf_bytes
+                        if show_pdf_log: st.session_state['pdf_match_logs'].append(f"✅ Match Found (Digits {case_digits}): {pdf_name}")
                         break
                 
+                if not matched_pdf and show_pdf_log:
+                     st.session_state['pdf_match_logs'].append("❌ No Match Found in uploaded PDFs.")
+
                 if matched_pdf:
                     # 1. 抓取主要代表圖
                     img_list_main, msg_main = extract_images_from_pdf_v13(matched_pdf, target_fig, case_key, debug=debug_mode, log_prefix="[Main] ")
@@ -597,7 +617,7 @@ with st.sidebar:
 
                 else:
                     if not target_fig: status["狀態"] = "⚠️ 缺資訊"; status["原因"] = "Word無代表圖"
-                    else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key} (已嘗試寬鬆比對)"
+                    else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key} (已嘗試V18超級清洗)"
                 status_report_list.append(status)
 
         if all_cases:
@@ -613,6 +633,7 @@ with st.sidebar:
             st.session_state['slides_data'] = []
             st.session_state['status_report'] = []
             st.session_state['debug_logs_map'] = {}
+            st.session_state['pdf_match_logs'] = []
             st.rerun()
 
 # --- 主畫面 ---
