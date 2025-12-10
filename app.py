@@ -556,7 +556,7 @@ with st.sidebar:
 
     if run_btn:
         st.session_state['debug_logs_map'] = {}
-        st.session_state['pdf_match_logs'] = []
+        st.session_state['pdf_match_logs'] = [] # Clear logs
         
         if not word_files:
             st.warning("⚠️ 請先上傳 Word 檔案！")
@@ -610,12 +610,16 @@ with st.sidebar:
                 for pdf_name, pdf_bytes in pdf_file_map.items():
                     norm_pdf_name = normalize_string(pdf_name)
                     
+                    # 1. 精準比對
                     if norm_case_key and ((norm_case_key in norm_pdf_name) or (norm_pdf_name in norm_case_key)):
                         if len(norm_case_key) > 5:
                             matched_pdf = pdf_bytes
                             if show_pdf_log: st.session_state['pdf_match_logs'].append(f"✅ Match Found (Exact): {pdf_name}")
                             break
                     
+                    # 2. 核心數字比對 (US11226533B2 -> 11226533)
+                    case_digits = re.sub(r'\D', '', case_key)
+                    # V19 修正: 使用最長數字序列，避免 B2 干擾
                     digit_groups = re.findall(r'\d+', case_key)
                     if digit_groups:
                         main_digits = sorted(digit_groups, key=len, reverse=True)[0]
@@ -628,6 +632,7 @@ with st.sidebar:
                      st.session_state['pdf_match_logs'].append("❌ No Match Found.")
 
                 if matched_pdf:
+                    # 1. 抓取主要代表圖 (V23 函數)
                     img_list_main, msg_main = extract_images_from_pdf_v23(matched_pdf, target_fig, case_key, debug=debug_mode, log_prefix="[Main] ")
                     
                     if img_list_main:
@@ -637,6 +642,7 @@ with st.sidebar:
                     else:
                         status["狀態"] = "⚠️ 缺圖"; status["原因"] = msg_main
 
+                    # 2. 抓取 Claim 附圖
                     if add_claim_slide:
                         specific_claim_fig = parse_fig_number_from_claim(claim_text_content)
                         img_list_claim = []
