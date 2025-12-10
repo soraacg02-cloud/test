@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V15 Claim 報告增強版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V15 Claim 報告增強版)")
-st.caption("更新：V15 在診斷報告中新增「Claim 圖狀態」欄位，並修正 Claim 分頁貼圖邏輯，確保圖片能正確顯示。")
+st.set_page_config(page_title="PPT 重組生成器 (V16 案號修正版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V16 案號修正版)")
+st.caption("更新：V16 修正案號讀取邏輯。增加自動去除「逗號」的處理 (例如 US 11,226,533 B2)，確保能抓取完整的專利號碼並正確對應 PDF。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -287,11 +287,25 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
     except Exception as e:
         return [], f"{log_prefix}PDF 解析錯誤: {str(e)}"
 
-# --- 函數：提取專利號 等 ---
+# --- 函數：提取專利號 (V16 修正：去除逗號) ---
 def extract_patent_number_from_text(text):
-    clean_text = text.replace("：", ":").replace(" ", "")
-    match = re.search(r'([a-zA-Z]{2,4}\d{4}[/]?\d+[a-zA-Z0-9]*|[a-zA-Z]{2,4}\d+[a-zA-Z]?)', clean_text)
+    # 1. 統一冒號並切割
+    if "：" in text: text = text.replace("：", ":")
+    
+    # 如果有冒號，只看冒號後面的部分，避免標題干擾
+    if ":" in text:
+        content = text.split(":", 1)[1]
+    else:
+        content = text
+
+    # 2. 關鍵修正：去除 "逗號" 與 "空白"
+    # US 11,226,533 B2 -> US11226533B2
+    clean_text = content.replace(" ", "").replace(",", "").strip().upper()
+    
+    # 3. Regex 抓取：國碼(2-4碼) + 數字(至少4碼) + 後綴(英數)
+    match = re.search(r'([A-Z]{2,4}\d{4,}[A-Z0-9]*)', clean_text)
     if match: return match.group(1)
+    
     return ""
 
 def extract_header_info_detail(raw_text):
