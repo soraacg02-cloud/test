@@ -15,12 +15,11 @@ import re
 import pandas as pd
 from PIL import Image
 import pytesseract
-from datetime import datetime
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V21 旋轉 OCR 版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V21 旋轉 OCR 版)")
-st.caption("更新：V21 新增「多角度 OCR」。當遇到橫向排列 (Landscape) 的圖片時，程式會自動旋轉頁面進行識別，確保能抓取各種方向的圖號。")
+st.set_page_config(page_title="PPT 重組生成器 (V22 結構佈局分析版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V22 結構佈局分析版)")
+st.caption("更新：V22 引入「結構佈局分析」。除了計算總字數，還會偵測頁面中是否包含「長句子」。若發現多行長句，即使包含圖號也會被判定為說明文而過濾，完美區分「複雜圖」與「說明頁」。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -85,8 +84,8 @@ def iter_block_items(parent):
         elif child.tag.endswith('tbl'):
             yield Table(child, parent)
 
-# --- 核心函數：V21 多角度 OCR ---
-def extract_images_from_pdf_v21(pdf_stream, target_fig_text, case_key, debug=False, log_prefix=""):
+# --- 核心函數：V22 結構佈局分析 + 旋轉 OCR ---
+def extract_images_from_pdf_v22(pdf_stream, target_fig_text, case_key, debug=False, log_prefix=""):
     if not target_fig_text:
         return [], f"{log_prefix}未指定圖號"
     
@@ -107,11 +106,15 @@ def extract_images_from_pdf_v21(pdf_stream, target_fig_text, case_key, debug=Fal
 
         target_numbers = sorted(list(set([m.upper() for m in matches])))
         
-        # V20/V21 參數
+        # === V22 核心參數 ===
         PAGE_TEXT_THRESHOLD_OCR = 1200 
         PAGE_TEXT_THRESHOLD_RAW = 1000 
-        LONG_SENTENCE_LIMIT = 80 
-        MAX_LONG_SENTENCES = 3
+        
+        # [V22 新增] 長句定義：超過 50 個字元就算長句 (圖片標號通常不會這麼長)
+        SENTENCE_LENGTH_THRESHOLD = 50 
+        # [V22 新增] 容許的長句數量：超過 2 行長句就判定為說明書
+        MAX_LONG_SENTENCES = 2 
+        
         SHORT_LABEL_LIMIT = 20 
         NORMAL_LINE_LIMIT = 40
 
@@ -143,7 +146,7 @@ def extract_images_from_pdf_v21(pdf_stream, target_fig_text, case_key, debug=Fal
                 clean_page_text_all = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', page_text_all)
                 page_text_len = len(clean_page_text_all)
 
-                # 1. 黑名單
+                # 1. 黑名單 (絕對過濾)
                 is_blacklist_page = False
                 for header in page_blacklist_headers:
                     if header in page_text_all:
@@ -152,15 +155,23 @@ def extract_images_from_pdf_v21(pdf_stream, target_fig_text, case_key, debug=Fal
                         break
                 if is_blacklist_page: continue
 
-                # 2. 長段落
+                # 2. [V22] 長句結構檢測 (Structure Check)
+                # 掃描有多少行是「長句子」
                 long_sentence_count = 0
                 for b in blocks:
-                    if len(re.sub(r'\s+', '', b[4])) > LONG_SENTENCE_LIMIT:
+                    # 去除空白後計算長度
+                    line_len = len(re.sub(r'\s+', '', b[4]))
+                    if line_len > SENTENCE_LENGTH_THRESHOLD:
                         long_sentence_count += 1
                 
+                # 若長句太多，判定為純文字頁，標記為 Heavy
                 is_text_heavy_page = False
-                if long_sentence_count > MAX_LONG_SENTENCES or page_text_len > PAGE_TEXT_THRESHOLD_RAW:
+                if long_sentence_count > MAX_LONG_SENTENCES:
                     is_text_heavy_page = True
+                    if debug and i < 15: debug_logs.append(f"{log_prefix}⚠️ P{i+1} marked Heavy (Long sentences: {long_sentence_count})")
+                elif page_text_len > PAGE_TEXT_THRESHOLD_RAW:
+                    is_text_heavy_page = True
+                    if debug and i < 15: debug_logs.append(f"{log_prefix}⚠️ P{i+1} marked Heavy (Word count: {page_text_len})")
 
                 # --- 策略 1: 原始文字層 ---
                 match_found_strategy_1 = False
@@ -172,8 +183,12 @@ def extract_images_from_pdf_v21(pdf_stream, target_fig_text, case_key, debug=Fal
                         if token in clean_block_text:
                             is_absolute_short = len(clean_block_text) < SHORT_LABEL_LIMIT
                             
+                            # 如果不是絕對短標籤，且頁面被標記為 Text Heavy，則跳過
+                            if not is_absolute_short and is_text_heavy_page:
+                                continue
+
+                            # 一般過濾
                             if not is_absolute_short:
-                                if is_text_heavy_page: continue 
                                 if len(clean_block_text) > NORMAL_LINE_LIMIT: continue
                                 is_sentence = False
                                 for stopword in SENTENCE_STOPWORDS:
@@ -201,7 +216,7 @@ def extract_images_from_pdf_v21(pdf_stream, target_fig_text, case_key, debug=Fal
                     if found_this_fig: break
                     continue
 
-                # --- 策略 2: 全頁 Fallback ---
+                # --- 策略 2: 全頁 Fallback (僅限非 Heavy 頁面) ---
                 if not is_text_heavy_page:
                     for token in search_tokens:
                         if token in clean_page_text_all:
@@ -222,17 +237,14 @@ def extract_images_from_pdf_v21(pdf_stream, target_fig_text, case_key, debug=Fal
                     if found_this_fig: break
                     continue
 
-                # --- 策略 3: OCR 模式 (V21 多角度) ---
-                if page_text_len < 1500: 
+                # --- 策略 3: OCR 模式 (含旋轉) ---
+                # 只有當字數沒那麼多，或者雖然多但我們還沒放棄希望時 (例如橫向圖)
+                if page_text_len < 2000: 
                     try:
-                        # 準備三個角度：0 (原圖), 270 (順時針90), 90 (逆時針90)
-                        # 因為 PyMuPDF 的旋轉是逆時針，所以 270 = 順時針轉90度
                         rotations = [0, 270, 90] 
-                        
                         match_ocr_found = False
 
                         for rot in rotations:
-                            # 取得圖片 (包含旋轉)
                             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
                             img_data = pix.tobytes("png")
                             pil_image = Image.open(BytesIO(img_data))
@@ -247,21 +259,30 @@ def extract_images_from_pdf_v21(pdf_stream, target_fig_text, case_key, debug=Fal
                             if debug and i < 15 and rot == 0: 
                                 debug_logs.append(f"{log_prefix}👁️ OCR P{i+1} Len: {ocr_len}")
 
-                            # 簡單檢查字數 (太高就跳過，避免浪費時間旋轉)
-                            if ocr_len > PAGE_TEXT_THRESHOLD_OCR:
-                                if rot == 0 and debug: debug_logs.append(f"{log_prefix}   -> Skip P{i+1} (OCR Heavy)")
-                                break # 這一頁字太多，不用試其他角度了
-
+                            # V22: OCR 也要做結構分析 (長句偵測)
                             ocr_lines = ocr_text.split('\n')
+                            long_sentence_count_ocr = 0
+                            for line in ocr_lines:
+                                 # 簡單清洗後算長度
+                                 clean_line_len = len(re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', line))
+                                 if clean_line_len > SENTENCE_LENGTH_THRESHOLD:
+                                     long_sentence_count_ocr += 1
                             
-                            # 檢查是否有找到圖號
+                            # 如果 OCR 讀出太多長句，且總字數又多 -> 跳過
+                            if long_sentence_count_ocr > MAX_LONG_SENTENCES and ocr_len > PAGE_TEXT_THRESHOLD_OCR:
+                                 if rot == 0 and debug: debug_logs.append(f"{log_prefix}   -> Skip P{i+1} (OCR Heavy Structure)")
+                                 break # 不用轉了，這就是文字頁
+
                             for line in ocr_lines:
                                 clean_line = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fa5]', '', line).upper()
                                 for token in search_tokens:
                                     if token in clean_line:
-                                        # 檢查
                                         is_absolute_short_ocr = len(clean_line) < SHORT_LABEL_LIMIT
+                                        
                                         if not is_absolute_short_ocr:
+                                            # 如果不是短標籤，且結構被判定為 Heavy -> 跳過
+                                            if long_sentence_count_ocr > MAX_LONG_SENTENCES: continue
+                                            
                                             if len(clean_line) > NORMAL_LINE_LIMIT: continue
                                             is_sentence_ocr = False
                                             for stopword in SENTENCE_STOPWORDS:
@@ -306,7 +327,7 @@ def extract_images_from_pdf_v21(pdf_stream, target_fig_text, case_key, debug=Fal
     except Exception as e:
         return [], f"{log_prefix}PDF 解析錯誤: {str(e)}"
 
-# --- 函數：提取專利號 ---
+# --- 函數：提取專利號 (V19 邏輯) ---
 def extract_patent_number_from_text(text):
     if "：" in text: text = text.replace("：", ":")
     if ":" in text:
@@ -318,7 +339,7 @@ def extract_patent_number_from_text(text):
     if match: return match.group(1)
     return ""
 
-# --- 函數：日期提取 ---
+# --- 函數：日期提取 (V20 英文支援) ---
 def parse_multiformat_date(text):
     if not text: return "(未找到)"
     text = text.strip()
@@ -610,7 +631,7 @@ with st.sidebar:
                      st.session_state['pdf_match_logs'].append("❌ No Match Found.")
 
                 if matched_pdf:
-                    img_list_main, msg_main = extract_images_from_pdf_v21(matched_pdf, target_fig, case_key, debug=debug_mode, log_prefix="[Main] ")
+                    img_list_main, msg_main = extract_images_from_pdf_v22(matched_pdf, target_fig, case_key, debug=debug_mode, log_prefix="[Main] ")
                     
                     if img_list_main:
                         case["image_list"] = img_list_main
@@ -625,7 +646,7 @@ with st.sidebar:
                         msg_claim = ""
                         
                         if specific_claim_fig:
-                            img_list_claim, msg_claim = extract_images_from_pdf_v21(matched_pdf, specific_claim_fig, case_key, debug=debug_mode, log_prefix="[Claim] ")
+                            img_list_claim, msg_claim = extract_images_from_pdf_v22(matched_pdf, specific_claim_fig, case_key, debug=debug_mode, log_prefix="[Claim] ")
                             if img_list_claim:
                                 status["Claim圖狀態"] = f"✅ 專屬 ({len(img_list_claim)}張)"
                                 status["Claim圖說明"] = f"找到指定圖: {specific_claim_fig}"
@@ -763,6 +784,7 @@ else:
                     p2 = tf.add_paragraph(); p2.text = f"日期：{data['clean_date']}"; p2.font.size = Pt(20); p2.font.bold = True
                     p3 = tf.add_paragraph(); p3.text = f"公司：{data['clean_company']}"; p3.font.size = Pt(20); p3.font.bold = True
                     
+                    # 貼上 Claim 圖片 (如果有)
                     claim_imgs = data.get('claim_image_list', [])
                     if claim_imgs:
                         img_left = Inches(5.5); img_top = Inches(0.5)
@@ -773,6 +795,7 @@ else:
                             this_left = 5.5 + (idx * (img_w + 0.1))
                             slide_c.shapes.add_picture(BytesIO(img_bytes), Inches(this_left), Inches(0.5), height=Inches(img_h))
 
+                    # 根據有無圖片調整文字框位置
                     left, width = Inches(0.5), Inches(12.3)
                     if claim_imgs:
                          top = Inches(3.6); height = Inches(3.4)
