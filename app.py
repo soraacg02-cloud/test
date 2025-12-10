@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V18 核心數字比對版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V18 核心數字比對版)")
-st.caption("更新：V18 採用「核心數字比對」策略。無視 PDF 檔名中的補零 (000) 或後綴 (p)，只要案號中的「純數字序列」相符，即可成功配對。")
+st.set_page_config(page_title="PPT 重組生成器 (V19 智能數字鎖定版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V19 智能數字鎖定版)")
+st.caption("更新：V19 修正了案號後綴 (如 B2) 干擾比對的問題。採用「最長數字序列」邏輯，能精準忽略補零 (000) 與版本號，並修復了 KeyError 報錯。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -62,14 +62,14 @@ components.html(
 )
 st.divider()
 
-# --- 初始化 Session State ---
+# --- 初始化 Session State (防止 KeyError) ---
 if 'slides_data' not in st.session_state:
     st.session_state['slides_data'] = []
 if 'status_report' not in st.session_state:
     st.session_state['status_report'] = []
 if 'debug_logs_map' not in st.session_state:
     st.session_state['debug_logs_map'] = {}
-if 'pdf_match_logs' not in st.session_state: # V18: 新增 PDF 配對日誌
+if 'pdf_match_logs' not in st.session_state: 
     st.session_state['pdf_match_logs'] = []
 
 # --- 輔助函數：遍歷 Word ---
@@ -268,7 +268,6 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
 
                 if found_this_fig: break
         
-        # 儲存 Log (Append 模式)
         if debug:
             if case_key not in st.session_state['debug_logs_map']:
                 st.session_state['debug_logs_map'][case_key] = ""
@@ -289,7 +288,7 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
     except Exception as e:
         return [], f"{log_prefix}PDF 解析錯誤: {str(e)}"
 
-# --- 函數：提取專利號 (V18 修正：超級清洗) ---
+# --- 函數：提取專利號 (V19 修正) ---
 def extract_patent_number_from_text(text):
     if "：" in text: text = text.replace("：", ":")
     if ":" in text:
@@ -297,10 +296,8 @@ def extract_patent_number_from_text(text):
     else:
         content = text
 
-    # V18: 超級清洗 (去除 空白, 逗號, 斜線, 連字號, 點)
+    # 去除 空白, 逗號, 斜線, 連字號, 點
     clean_text = content.replace(" ", "").replace(",", "").replace("/", "").replace("-", "").replace(".", "").strip().upper()
-    
-    # 放寬 Regex: 國碼 + 數字 (不強求後綴，只要有數字)
     match = re.search(r'([A-Z]{2,4}\d{4,}[A-Z0-9]*)', clean_text)
     if match: return match.group(1)
     
@@ -502,7 +499,7 @@ with st.sidebar:
 
     if run_btn:
         st.session_state['debug_logs_map'] = {}
-        st.session_state['pdf_match_logs'] = [] # Clear logs
+        st.session_state['pdf_match_logs'] = []
         
         if not word_files:
             st.warning("⚠️ 請先上傳 Word 檔案！")
@@ -550,9 +547,9 @@ with st.sidebar:
                 matched_pdf = None
                 norm_case_key = normalize_string(case_key)
                 
-                # === V18: PDF 配對邏輯 (含日誌) ===
+                # === V19: PDF 配對邏輯 (最長數字序列比對) ===
                 if show_pdf_log:
-                    st.session_state['pdf_match_logs'].append(f"\n--- Matching Case: {case_key} (Norm: {norm_case_key}) ---")
+                    st.session_state['pdf_match_logs'].append(f"\n--- Matching Case: {case_key} ---")
 
                 for pdf_name, pdf_bytes in pdf_file_map.items():
                     norm_pdf_name = normalize_string(pdf_name)
@@ -564,18 +561,22 @@ with st.sidebar:
                             if show_pdf_log: st.session_state['pdf_match_logs'].append(f"✅ Match Found (Exact): {pdf_name}")
                             break
                     
-                    # 2. 核心數字比對 (US11226533B2 -> 11226533)
-                    case_digits = re.sub(r'\D', '', case_key)
-                    if len(case_digits) >= 4 and case_digits in norm_pdf_name:
-                        matched_pdf = pdf_bytes
-                        if show_pdf_log: st.session_state['pdf_match_logs'].append(f"✅ Match Found (Digits {case_digits}): {pdf_name}")
-                        break
+                    # 2. V19 核心：最長數字序列比對 (修復 B2 干擾)
+                    # 提取所有連續數字組 ['12468207', '2']
+                    digit_groups = re.findall(r'\d+', case_key)
+                    if digit_groups:
+                        # 找出最長的一組數字 (通常就是主案號)
+                        main_digits = sorted(digit_groups, key=len, reverse=True)[0]
+                        
+                        if len(main_digits) >= 4 and main_digits in norm_pdf_name:
+                            matched_pdf = pdf_bytes
+                            if show_pdf_log: st.session_state['pdf_match_logs'].append(f"✅ Match Found (MainDigits {main_digits}): {pdf_name}")
+                            break
                 
                 if not matched_pdf and show_pdf_log:
-                     st.session_state['pdf_match_logs'].append("❌ No Match Found in uploaded PDFs.")
+                     st.session_state['pdf_match_logs'].append("❌ No Match Found.")
 
                 if matched_pdf:
-                    # 1. 抓取主要代表圖
                     img_list_main, msg_main = extract_images_from_pdf_v13(matched_pdf, target_fig, case_key, debug=debug_mode, log_prefix="[Main] ")
                     
                     if img_list_main:
@@ -585,7 +586,6 @@ with st.sidebar:
                     else:
                         status["狀態"] = "⚠️ 缺圖"; status["原因"] = msg_main
 
-                    # 2. 抓取 Claim 附圖
                     if add_claim_slide:
                         specific_claim_fig = parse_fig_number_from_claim(claim_text_content)
                         img_list_claim = []
@@ -617,7 +617,7 @@ with st.sidebar:
 
                 else:
                     if not target_fig: status["狀態"] = "⚠️ 缺資訊"; status["原因"] = "Word無代表圖"
-                    else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key} (已嘗試V18超級清洗)"
+                    else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key}"
                 status_report_list.append(status)
 
         if all_cases:
@@ -714,6 +714,7 @@ else:
             p = shape.text_frame.paragraphs[0]; p.text = data['key_point']; p.alignment = PP_ALIGN.CENTER; p.font.size = Pt(20); p.font.bold = True
             shape.text_frame.vertical_anchor = MSO_SHAPE.RECTANGLE
 
+            # === Claim Slides ===
             if need_claim_slide:
                 claims_groups = split_claims_text(data['claim_text'])
                 if not claims_groups and data['claim_text'].strip():
