@@ -17,9 +17,9 @@ from PIL import Image
 import pytesseract
 
 # --- 設定網頁標題 ---
-st.set_page_config(page_title="PPT 重組生成器 (V16 案號修正版)", page_icon="📑", layout="wide")
-st.title("📑 PPT 重組生成器 (V16 案號修正版)")
-st.caption("更新：V16 修正案號讀取邏輯。增加自動去除「逗號」的處理 (例如 US 11,226,533 B2)，確保能抓取完整的專利號碼並正確對應 PDF。")
+st.set_page_config(page_title="PPT 重組生成器 (V17 寬鬆比對版)", page_icon="📑", layout="wide")
+st.title("📑 PPT 重組生成器 (V17 寬鬆比對版)")
+st.caption("更新：V17 加入「核心數字比對」機制。當 PDF 檔名包含額外的零 (如 us000123...) 時，程式能透過識別關鍵數字串 (如 123) 成功找到對應檔案。")
 
 # === NBLM 提示詞區塊 ===
 nblm_prompt = """根據上傳的所有來源，分開整理出以下重點(不要表格)：
@@ -266,7 +266,6 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
 
                 if found_this_fig: break
         
-        # 儲存 Log (Append 模式)
         if debug:
             if case_key not in st.session_state['debug_logs_map']:
                 st.session_state['debug_logs_map'][case_key] = ""
@@ -289,20 +288,13 @@ def extract_images_from_pdf_v13(pdf_stream, target_fig_text, case_key, debug=Fal
 
 # --- 函數：提取專利號 (V16 修正：去除逗號) ---
 def extract_patent_number_from_text(text):
-    # 1. 統一冒號並切割
     if "：" in text: text = text.replace("：", ":")
-    
-    # 如果有冒號，只看冒號後面的部分，避免標題干擾
     if ":" in text:
         content = text.split(":", 1)[1]
     else:
         content = text
 
-    # 2. 關鍵修正：去除 "逗號" 與 "空白"
-    # US 11,226,533 B2 -> US11226533B2
     clean_text = content.replace(" ", "").replace(",", "").strip().upper()
-    
-    # 3. Regex 抓取：國碼(2-4碼) + 數字(至少4碼) + 後綴(英數)
     match = re.search(r'([A-Z]{2,4}\d{4,}[A-Z0-9]*)', clean_text)
     if match: return match.group(1)
     
@@ -468,7 +460,6 @@ def split_claims_text(full_text):
     return claims
 
 def parse_fig_number_from_claim(claim_text):
-    """從 Claim 文字中偵測是否有指定特定圖號"""
     if not claim_text: return None
     matches = re.findall(r'(?:FIG\.?|Figure|图|圖)[\s\.]*([0-9]+[A-Za-z]*)', claim_text, re.IGNORECASE)
     if matches:
@@ -546,12 +537,22 @@ with st.sidebar:
                 matched_pdf = None
                 norm_case_key = normalize_string(case_key)
                 
+                # === V17 修正：寬鬆比對邏輯 (Smart Matching) ===
                 for pdf_name, pdf_bytes in pdf_file_map.items():
                     norm_pdf_name = normalize_string(pdf_name)
+                    
+                    # 1. 精準比對 (舊邏輯)
                     if norm_case_key and ((norm_case_key in norm_pdf_name) or (norm_pdf_name in norm_case_key)):
                         if len(norm_case_key) > 5:
                             matched_pdf = pdf_bytes
                             break
+                    
+                    # 2. 核心數字比對 (新邏輯)
+                    # 提取 Case 中的純數字: US11226533B2 -> 11226533
+                    case_digits = re.sub(r'\D', '', case_key)
+                    if len(case_digits) >= 4 and case_digits in norm_pdf_name:
+                        matched_pdf = pdf_bytes
+                        break
                 
                 if matched_pdf:
                     # 1. 抓取主要代表圖
@@ -596,7 +597,7 @@ with st.sidebar:
 
                 else:
                     if not target_fig: status["狀態"] = "⚠️ 缺資訊"; status["原因"] = "Word無代表圖"
-                    else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key}"
+                    else: status["狀態"] = "❌ 無PDF"; status["原因"] = f"找不到PDF: {case_key} (已嘗試寬鬆比對)"
                 status_report_list.append(status)
 
         if all_cases:
